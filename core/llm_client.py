@@ -339,7 +339,6 @@ def call_llm_text(
     Used by planner, executor, error_handler, code_helper, dev_agent.
     """
     url, default_model = get_llm_settings()
-    endpoint = f"{url}/api/chat"
     m        = model or default_model
 
     messages: list[dict] = []
@@ -347,18 +346,40 @@ def call_llm_text(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    payload = {"model": m, "messages": messages, "stream": False, "keep_alive": -1, "options": {"num_predict": 600}}
+    if get_llm_provider() == "openai":
+        endpoint = f"{url}/v1/chat/completions"
+        payload = {
+            "model": m,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": 600,
+        }
+    else:
+        endpoint = f"{url}/api/chat"
+        payload = {
+            "model": m,
+            "messages": messages,
+            "stream": False,
+            "keep_alive": -1,
+            "options": {"num_predict": 600},
+        }
 
     try:
         resp = requests.post(endpoint, json=payload, timeout=timeout)
         resp.raise_for_status()
-        return (resp.json().get("message", {}).get("content") or "").strip()
+        data = resp.json()
+        if get_llm_provider() == "openai":
+            return (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+        return (data.get("message", {}).get("content") or "").strip()
     except requests.exceptions.ConnectionError:
         if ensure_ollama_running():
             try:
                 resp = requests.post(endpoint, json=payload, timeout=timeout)
                 resp.raise_for_status()
-                return (resp.json().get("message", {}).get("content") or "").strip()
+                data = resp.json()
+                if get_llm_provider() == "openai":
+                    return (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+                return (data.get("message", {}).get("content") or "").strip()
             except Exception:
                 pass
         raise RuntimeError(

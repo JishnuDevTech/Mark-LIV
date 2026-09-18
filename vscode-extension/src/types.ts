@@ -1,0 +1,4 @@
+export type BridgeStatus = 'online' | 'offline' | 'checking';
+export interface JarvisState { [key: string]: unknown; jarvis?: { status?: string; active_task?: string; active_project?: string }; tasks?: { active?: unknown; background?: unknown[]; items?: unknown[] }; agents?: unknown[]; events?: unknown[]; notifications?: unknown[]; controls?: unknown; }
+export interface ProjectContext { folders: string[]; activeEditor?: { path: string; languageId: string; selection?: string; line?: number }; diagnostics: Array<{file:string; severity:string; message:string; line:number; source?:string}>; changedFiles: string[]; files: Array<{path:string; content?:string; truncated?:boolean}>; snapshot: { fileCount:number; languages: Record<string,number>; indexedAt:string }; }
+export interface BridgeSnapshot { status: BridgeStatus; state?: JarvisState; health?: unknown; controls?: unknown; lastError?: string; checkedAt?: string; }

@@ -147,10 +147,25 @@ def _recursive_update(target: dict, updates: dict) -> bool:
             if _recursive_update(target[key], value):
                 changed = True
         else:
-            new_val  = _truncate_value(str(value["value"] if isinstance(value, dict) else value))
-            entry    = {"value": new_val, "updated": datetime.now().strftime("%Y-%m-%d")}
+            metadata = value if isinstance(value, dict) else {}
+            new_val  = _truncate_value(str(metadata.get("value", value)))
+            try:
+                importance = max(0.0, min(1.0, float(metadata.get("importance", 0.7))))
+            except (TypeError, ValueError):
+                importance = 0.7
+            entry    = {
+                "value": new_val,
+                "updated": datetime.now().strftime("%Y-%m-%d"),
+                "type": str(metadata.get("type", "fact")),
+                "source": str(metadata.get("source", "conversation")),
+                "importance": importance,
+            }
             existing = target.get(key, {})
-            if not isinstance(existing, dict) or existing.get("value") != new_val:
+            if (not isinstance(existing, dict)
+                    or existing.get("value") != new_val
+                    or existing.get("type") != entry["type"]
+                    or existing.get("source") != entry["source"]
+                    or existing.get("importance") != entry["importance"]):
                 target[key] = entry
                 changed = True
     return changed

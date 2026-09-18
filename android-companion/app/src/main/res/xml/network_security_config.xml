@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- The HTTP endpoint is LAN-only and is used for pairing when the
+         desktop's locally generated certificate is not trusted by Android. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

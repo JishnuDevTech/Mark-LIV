@@ -72,11 +72,23 @@ from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
+    get_preferences, save_preferences,
 )
 from core.plugin_loader        import discover_plugins
+from core.plugin_manager      import PluginManager
+from core.mobile_capabilities import MobileCapabilityManager
+from core.capability_orchestrator import (
+    DynamicCapabilityRegistry, ToolRouter, TaskOrchestrator,
+    BossCoordinator,
+)
+from core.specialist_agents import AgentManager
+from core.communication_manager import CommunicationManager
+from core import event_engine
+from core.runtime_state import runtime_state
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
+from core                      import context_manager
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
@@ -340,6 +352,53 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "system_capabilities",
+        "description": (
+            "List the connected mobile devices, their capabilities and permissions, "
+            "enabled plugins, and the plugin tools currently available to JARVIS."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {}},
+    },
+    {
+        "name": "assign_specialist",
+        "description": (
+            "Assign a concrete tool task to FRIDAY, ULTRON, or MESSENGER. "
+            "Use system_capabilities first when unsure which specialist is available."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "agent": {"type": "STRING", "description": "FRIDAY, ULTRON, or MESSENGER"},
+                "tool": {"type": "STRING", "description": "Existing capability to execute"},
+                "parameters": {"type": "OBJECT", "description": "Tool parameters"},
+                "objective": {"type": "STRING"},
+                "project_id": {"type": "STRING"},
+            },
+            "required": ["agent", "tool"],
+        },
+    },
+    {
+        "name": "delegate_objective",
+        "description": (
+            "JARVIS remains the boss and delegates a complex user objective to "
+            "the appropriate specialist agents. Use only when the objective "
+            "requires specialist work; collect and summarize their results."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "objective": {"type": "STRING"},
+                "project_id": {"type": "STRING"},
+                "user_instructions": {"type": "STRING"},
+                "tools": {
+                    "type": "OBJECT",
+                    "description": "Optional specialist-to-tool mapping.",
+                },
+            },
+            "required": ["objective"],
+        },
+    },
+    {
         "name": "screen_process",
         "description": (
             "Captures the screen or webcam image and lets you analyze it. "
@@ -593,6 +652,8 @@ class JarvisLive:
         self._resume_handle: str | None = None
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
+        self._communication = CommunicationManager(logger=lambda msg: print(msg))
+        self._mobile_capabilities = MobileCapabilityManager(logger=lambda msg: print(msg))
         self._briefing_sent    = False          # morning briefing fires once per process
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._proactive        = ProactiveEngine()
@@ -625,8 +686,71 @@ class JarvisLive:
             logger=lambda msg: print(f"[Plugins] {msg}"),
             notify=lambda msg: self.ui.write_log(f"SYS: {msg}"),
         )
-        self.ui.get_plugins = self._plugin_registry.list_for_ui
-        self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
+        self._plugin_manager = PluginManager(
+            self._plugin_registry,
+            logger=lambda msg: print(msg),
+            notify=lambda msg: self.ui.write_log(f"SYS: {msg}"),
+        )
+        # Central orchestration composes the registries above.  Existing tool
+        # execution remains the compatibility path in _execute_tool; the
+        # router is used by planned tasks and never replaces those branches.
+        self._capability_registry = DynamicCapabilityRegistry(
+            logger=lambda msg: print(msg),
+        ).refresh(
+            action_registry=self._action_registry,
+            plugin_manager=self._plugin_manager,
+            mobile_manager=self._mobile_capabilities,
+        )
+        self._tool_router = ToolRouter(self._capability_registry)
+        self._task_orchestrator = TaskOrchestrator(
+            self._tool_router, runtime=runtime_state,
+        )
+        # Specialists are thin adapters over the same router/context/event/mobile
+        # services; they do not create parallel registries or task stores.
+        self._agent_manager = AgentManager(
+            self._tool_router,
+            context=context_manager,
+            events=event_engine,
+            plugin_manager=self._plugin_manager,
+            mobile_manager=self._mobile_capabilities,
+            logger=lambda msg: print(f"[Agents] {msg}"),
+        )
+        self._boss_coordinator = BossCoordinator(
+            self._agent_manager, event_engine, runtime=runtime_state,
+            logger=lambda msg: print(f"[JARVIS] {msg}"),
+        )
+        # Stage 4 facade: existing managers remain authoritative; this only
+        # indexes their live state and coordinates cross-system decisions.
+        self._runtime_state = runtime_state
+        self._runtime_state.recover()
+        self._runtime_state.set_preferences(get_preferences())
+        import platform as _runtime_platform
+        self._runtime_state.update_component("computer", "host", {
+            "platform": _runtime_platform.platform(),
+            "processor": _runtime_platform.processor(),
+        })
+        self._runtime_state.update_component("device", "audio", {
+            "input": get_input_device(), "output": get_output_device(),
+        })
+        self._runtime_state.update_component("screen", "session", {
+            "vision_active": self._vision_cam_active,
+        })
+        self._runtime_state.update_component("provider", "router", {"providers": ["gemini", "openrouter", "local"]})
+        self._runtime_state.update_component("mobile", "manager",
+                                              self._mobile_capabilities.snapshot())
+        self._runtime_state.update_component("plugin", "manager",
+                                              self._plugin_manager.capability_snapshot())
+        self._runtime_state.update_component("agent", "manager",
+                                              self._agent_manager.health())
+        self._runtime_state.update_component("task", "orchestrator",
+                                              {"states": self._task_orchestrator.STATES})
+        self._runtime_state.update_component("event", "engine",
+                                              {"recent": event_engine.recent(5)})
+        self._runtime_state.update_component("notification", "mobile",
+                                              {"available": bool(self._mobile_capabilities.connected_devices())})
+        self.ui.get_plugins = self._plugin_manager.list_for_ui
+        self.ui.get_plugin_settings = self._plugin_manager.settings_schemas  # ⚙ settings tab
+        self.ui.plugin_lifecycle = self._plugin_manager.lifecycle
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
 
         # ── Wake word ────────────────────────────────────────────────────────
@@ -651,6 +775,46 @@ class JarvisLive:
         self.ui.on_wake_toggle   = self._ui_wake_toggle   # (enable: bool) -> str
         self.ui.on_wake_manual   = self._ui_wake_manual   # () -> toggle awake/asleep
         self.ui.on_wake_install  = self._ui_wake_install  # () -> (ok, msg)
+
+    # ── Stage 4 runtime facade API ─────────────────────────────────────────
+
+    def runtime_snapshot(self) -> dict:
+        """Return the persisted central state without exposing manager internals."""
+        return self._runtime_state.snapshot()
+
+    def runtime_diagnostics(self) -> dict:
+        return self._runtime_state.diagnostics()
+
+    def classify_event(self, event: dict | str, context: str = "") -> dict:
+        decision = self._runtime_state.decide_event(event, context=context)
+        self._runtime_state.update_component("event", str(
+            decision.get("event_id") or decision.get("event_type") or "last"), decision)
+        return decision
+
+    def set_user_availability(self, status: str, **details) -> dict:
+        return self._runtime_state.set_availability(status, **details)
+
+    def set_autonomy_level(self, level: str) -> str:
+        return self._runtime_state.set_autonomy(level)
+
+    def get_preferences(self) -> dict:
+        return self._runtime_state.preferences()
+
+    def set_preferences(self, values: dict) -> dict:
+        save_preferences(values)
+        return self._runtime_state.set_preferences(values)
+
+    def create_goal(self, title: str, **fields) -> dict:
+        return self._runtime_state.save_goal(title, **fields)
+
+    def list_goals(self, status: str = "") -> list[dict]:
+        return self._runtime_state.goals(status)
+
+    def register_background_task(self, objective: str, **fields) -> dict:
+        return self._runtime_state.register_background_task(objective, **fields)
+
+    def update_background_task(self, task_id: str, status: str, **fields) -> dict | None:
+        return self._runtime_state.update_background_task(task_id, status, **fields)
 
     # ── Wake word: state machine ─────────────────────────────────────────────
 
@@ -825,8 +989,16 @@ class JarvisLive:
             return None
         key    = self._dashboard.new_key()
         url    = self._dashboard.get_url()
+        phone_url = self._dashboard.get_phone_url()
         manual = self._dashboard.get_manual_url()
-        return url, key, f"{url}/auto-login?key={key}", manual
+        # Native Android pairing uses an app deep link. The existing browser
+        # auto-login URL remains available as the fourth value for legacy QR
+        # consumers, while the UI's QR encodes the native link.
+        from urllib.parse import quote
+        native_qr = (
+            f"jarvis://pair?server={quote(phone_url, safe='')}&key={quote(key)}"
+        )
+        return phone_url, key, native_qr, manual
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -949,6 +1121,25 @@ class JarvisLive:
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
+    async def orchestrate_task(self, objective: str, steps: list[dict] | None = None,
+                               project_id: str = "") -> dict:
+        """Run a planned task through the central router.
+
+        The live function-call path below intentionally remains unchanged; this
+        API is for multi-step callers that need planning and verification.
+        """
+        self._capability_registry.refresh(
+            action_registry=self._action_registry,
+            plugin_manager=self._plugin_manager,
+            mobile_manager=self._mobile_capabilities,
+        )
+        state = self._task_orchestrator.plan(
+            objective, steps or [], project_id=project_id,
+        )
+        return await self._task_orchestrator.execute(
+            state, player=self.ui, session_memory=None,
+        )
+
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
 
@@ -963,6 +1154,19 @@ class JarvisLive:
 
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
+        try:
+            _state = context_manager.get_state()
+            _active_project = _state.get("active_project", "") if isinstance(_state, dict) else ""
+            _jarvis_context = context_manager.retrieve_context(
+                request="continue the current task or project",
+                project_id=_active_project,
+                include_personal=False,
+                limit=8,
+            )
+            _context_str = json.dumps(_jarvis_context, ensure_ascii=False)
+        except Exception as _e:
+            print(f"[Context] Could not build active context: {_e}")
+            _context_str = ""
         sys_prompt = _load_system_prompt()
 
         now      = datetime.now()
@@ -991,6 +1195,20 @@ class JarvisLive:
             f"Always refer to yourself as {self._asst_name}.\n"
             f"{_addr}\n\n"
         )
+        _external = self._runtime_state.snapshot().get("external_capabilities", {})
+        if _external:
+            connected = [
+                f"{key}: {', '.join(item.get('capabilities', []))}"
+                for key, item in _external.items()
+                if item.get("connected")
+            ]
+            if connected:
+                try:
+                    context_payload = json.loads(_context_str)
+                    context_payload["connected_hands"] = connected
+                    _context_str = json.dumps(context_payload, ensure_ascii=False)
+                except json.JSONDecodeError:
+                    _context_str += "\nConnected hands: " + "; ".join(connected)
 
         # Everything the model is told about *itself* is derived here, not
         # written into prompt.txt: the name comes from config, the platform from
@@ -999,7 +1217,8 @@ class JarvisLive:
         # and this follows without anyone editing a prompt.
         _all_decls = (TOOL_DECLARATIONS
                       + self._action_registry.get_tool_declarations()
-                      + self._plugin_registry.get_tool_declarations())
+                      + self._plugin_manager.tool_declarations()
+                      + self._mobile_capabilities.declarations())
         _names = {(d.get("name") if isinstance(d, dict) else getattr(d, "name", ""))
                   for d in _all_decls}
         sys_prompt = _render_prompt(sys_prompt, {
@@ -1015,6 +1234,13 @@ class JarvisLive:
         parts = [time_ctx, identity_ctx]
         if mem_str:
             parts.append(mem_str)
+        if _context_str and _context_str not in ("{}", '{"active_conversation": {"messages": [], "summary": ""}, "working_task": {}}'):
+            parts.append(
+                "[JARVIS ACTIVE TASK/PROJECT CONTEXT]\n"
+                "This state belongs to JARVIS, not to the model. Preserve it and "
+                "continue the current work unless the user explicitly changes direction.\n"
+                + _context_str
+            )
         parts.append(sys_prompt)
 
         cfg = dict(
@@ -1196,6 +1422,47 @@ class JarvisLive:
                 r = await loop.run_in_executor(None, get_system_status)
                 result = str(r)
 
+            elif name == "system_capabilities":
+                self._capability_registry.refresh(
+                    action_registry=self._action_registry,
+                    plugin_manager=self._plugin_manager,
+                    mobile_manager=self._mobile_capabilities,
+                )
+                result = json.dumps({
+                    "mobile": self._mobile_capabilities.snapshot(),
+                    "plugins": self._plugin_manager.capability_snapshot(),
+                    "plugin_tools": self._plugin_manager.tool_declarations(),
+                    "capabilities": self._capability_registry.snapshot(),
+                    "specialists": self._agent_manager.list(),
+                    "specialist_health": self._agent_manager.health(),
+                }, ensure_ascii=False)
+
+            elif name == "assign_specialist":
+                _agent_task = {
+                    "tool": str(args.get("tool", "")).strip(),
+                    "parameters": dict(args.get("parameters") or {}),
+                    "objective": str(args.get("objective", "")).strip(),
+                }
+                _agent_result = await self._agent_manager.assign(
+                    args.get("agent", ""),
+                    _agent_task,
+                    project_id=str(args.get("project_id", "")).strip(),
+                    player=self.ui,
+                    session_memory=None,
+                )
+                result = json.dumps(_agent_result, ensure_ascii=False)
+
+            elif name == "delegate_objective":
+                _delegated = await self._boss_coordinator.delegate(
+                    str(args.get("objective", "")),
+                    project_id=str(args.get("project_id", "")).strip(),
+                    user_instructions=str(args.get("user_instructions", "")),
+                    tools=dict(args.get("tools") or {}),
+                    player=self.ui,
+                    session_memory=None,
+                )
+                result = json.dumps(_delegated, ensure_ascii=False)
+
             elif name == "manage_monitor":
                 action = args.get("action", "").lower().strip()
                 topic  = args.get("topic", "").strip()
@@ -1244,12 +1511,24 @@ class JarvisLive:
                     self.ui.show_content(_label, r)
 
             else:
-                if self._plugin_registry.has(name):
-                    r = await loop.run_in_executor(
-                        None,
-                        lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
+                if name in {
+                    "get_mobile_status", "mobile_status", "send_mobile_notification",
+                    "mobile_notify", "get_battery_status", "get_connection_status",
+                    "send_mobile_message",
+                }:
+                    result = json.dumps(
+                        await self._mobile_capabilities.execute(name, args),
+                        ensure_ascii=False,
                     )
-                    result = r or "Done."
+                elif self._plugin_manager.has_tool(name):
+                    outcome = await loop.run_in_executor(
+                        None,
+                        lambda: self._plugin_manager.execute(
+                            name, args, player=self.ui, session_memory=None,
+                            confirmed=bool(args.get("confirmed", False)),
+                        )
+                    )
+                    result = json.dumps(outcome, ensure_ascii=False)
                 else:
                     result = f"Unknown tool: {name}"
 
@@ -1263,6 +1542,24 @@ class JarvisLive:
 
         print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
 
+        # Keep relevant computer/project observations in JARVIS-owned working
+        # context so a later reasoning provider can continue from them.
+        if (name in {"project_access", "computer_control", "file_controller", "file_processor", "productivity"}
+            or self._plugin_manager.has_tool(name)):
+            try:
+                _state = context_manager.get_state()
+                _project_id = _state.get("active_project", "") if isinstance(_state, dict) else ""
+                if _project_id:
+                    context_manager.record_event(
+                        _project_id, "tool_result", str(result)[:2000], tool=name,
+                    )
+                    context_manager.update_task(
+                        current_step=f"{name}: {args.get('operation', args.get('action', 'completed'))}",
+                        intermediate_results=[str(result)[:1200]],
+                    )
+            except Exception as _context_error:
+                print(f"[Context] Tool result capture failed: {_context_error}")
+
         # A tool that declared itself NON_BLOCKING also says when its answer may
         # re-enter the conversation. Without this the model finishes whatever it
         # was saying and then reads the result out on top of it — which, for
@@ -1270,7 +1567,7 @@ class JarvisLive:
         # non-blocking call was meant to avoid. Tools that declared nothing get
         # the API default and behave as they always have.
         _sched = (self._action_registry.scheduling(name)
-                  or self._plugin_registry.scheduling(name))
+                  or self._plugin_manager.scheduling(name))
         _extra = {"scheduling": _sched} if _sched else {}
         return types.FunctionResponse(
             id=fc.id, name=name,
@@ -1534,6 +1831,7 @@ class JarvisLive:
                                 self._last_out_logged = ""   # new exchange
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
+                                context_manager.record_conversation(full_in, role="user")
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "user",
@@ -1553,6 +1851,7 @@ class JarvisLive:
                                 self._last_out_logged = full_out
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
+                                context_manager.record_conversation(full_out, role="assistant")
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "jarvis",
@@ -1710,6 +2009,11 @@ class JarvisLive:
 
                 try:
                     await asyncio.to_thread(stream.write, bytes(batch))
+                    if self._dashboard:
+                        try:
+                            await self._dashboard.broadcast_phone_audio(bytes(batch))
+                        except Exception as _phone_audio_error:
+                            print(f"[Dashboard] Phone audio delivery deferred: {_phone_audio_error}")
                 except (RuntimeError, asyncio.CancelledError):
                     break   # executor shutting down — exit cleanly
         except Exception as e:
@@ -2006,6 +2310,89 @@ class JarvisLive:
     def _on_phone_connected(self) -> None:
         self.ui.write_log("SYS: Phone connected via Remote Dashboard.")
         self.ui.notify_phone_connected()
+        event = self._communication.record(
+            "PHONE_CONNECTED", "Android companion connected.",
+            source="dashboard", importance="NORMAL", dedupe_key="phone-connected",
+        )
+        if self._dashboard:
+            asyncio.create_task(self._communication.publish(event))
+
+    def _phone_state(self) -> dict:
+        """Small mobile snapshot; never exposes the full memory database."""
+        try:
+            from core import productivity_store
+            state = context_manager.get_state()
+            task = state.get("active_task", {}) if isinstance(state, dict) else {}
+            runtime = self._runtime_state.snapshot() if hasattr(self, "_runtime_state") else {}
+            components = runtime.get("components", {}) if isinstance(runtime, dict) else {}
+            return {
+                "jarvis_status": "active" if self.session else "offline",
+                "active_task": task,
+                "active_project": state.get("active_project", "") if isinstance(state, dict) else "",
+                "tasks": productivity_store.list_tasks()[:20],
+                "schedule": productivity_store.list_events()[:20],
+                "plugins": self._plugin_manager.list_for_ui() if self._plugin_manager else [],
+                "mobile": self._mobile_capabilities.snapshot(),
+                "pending_approvals": [],
+                "runtime": runtime,
+                "agents": self._agent_manager.list() if hasattr(self, "_agent_manager") else [],
+                "agent_tasks": self._agent_manager.tasks(50) if hasattr(self, "_agent_manager") else [],
+                "agent_communications": self._agent_manager.communications(50) if hasattr(self, "_agent_manager") else [],
+                "agent_hierarchy": [{
+                    "name": "JARVIS", "role": "orchestrator", "parent": None,
+                    "children": [agent.get("name") for agent in self._agent_manager.list()],
+                }] if hasattr(self, "_agent_manager") else [],
+                "health": self.runtime_diagnostics() if hasattr(self, "_runtime_state") else {},
+                "goals": self.list_goals() if hasattr(self, "_runtime_state") else [],
+                "autonomy": runtime.get("autonomy", "suggest"),
+                "availability": runtime.get("availability", {}),
+                "provider": components.get("provider", {}),
+                "events": event_engine.recent(50),
+                "background_tasks": list(runtime.get("background_tasks", {}).values()),
+                "controls": {
+                    "autonomy": {"supported": True, "values": ["manual", "suggest", "supervised", "autonomous"]},
+                    "availability": {"supported": True, "values": ["available", "busy", "away", "do_not_disturb", "offline"]},
+                    "preferences": {"supported": True},
+                    "agents": {"supported": True},
+                    "plugins": {"supported": False},
+                    "devices": {"supported": False},
+                },
+            }
+        except Exception as exc:
+            return {"jarvis_status": "error", "error": str(exc)}
+
+    def _dashboard_control(self, control: str, value):
+        """Apply only controls backed by the existing core state/configuration."""
+        control = str(control or "").strip().lower()
+        if control == "autonomy":
+            return {"autonomy": self.set_autonomy_level(str(value))}
+        if control == "availability":
+            return self.set_user_availability(str(value))
+        if control == "preferences":
+            if not isinstance(value, dict):
+                raise ValueError("preferences must be an object")
+            return {"preferences": self.set_preferences(value)}
+        if control.startswith("agent."):
+            name = control.split(".", 1)[1].upper()
+            agent = self._agent_manager.get(name)
+            if agent is None:
+                raise ValueError(f"Specialist '{name}' is not registered")
+            agent.enabled = bool(value)
+            self._runtime_state.update_component("agent", name, agent.status())
+            return {"agent": name, "enabled": agent.enabled}
+        raise ValueError(f"Unsupported control: {control}")
+
+    def _register_bridge_capabilities(
+        self, capabilities, *, source="unknown", device_id="default", metadata=None,
+    ):
+        registered = [str(item) for item in capabilities if str(item).strip()]
+        return self._runtime_state.register_external_capabilities(
+            source, registered, device_id=device_id,
+            metadata={
+                "role": "workspace hands" if source == "vscode" else "external client",
+                **(metadata or {}),
+            },
+        )
 
     # ── dashboard command relay ─────────────────────────────────────────────
 
@@ -2071,9 +2458,36 @@ class JarvisLive:
             from dashboard.server import DashboardServer
             self._dashboard = DashboardServer()
             self._dashboard.set_connect_callback(self._on_phone_connected)
+            self._dashboard.set_state_callback(self._phone_state)
+            self._dashboard.set_control_callback(self._dashboard_control)
+            self._dashboard.set_capability_callback(self._register_bridge_capabilities)
+            self._dashboard.set_device_callback(self._mobile_capabilities.set_connected)
+            self._dashboard.set_device_telemetry_callback(
+                self._mobile_capabilities.update_telemetry
+            )
+            self._mobile_capabilities.attach_dashboard(self._dashboard)
+            self._communication.attach_dashboard(self._dashboard)
             asyncio.create_task(self._dashboard.serve())
             # Runs for the whole lifetime, not just inside an active session
             asyncio.create_task(self._process_dashboard_commands())
+            # Make pairing available even when the optional Controls drawer is
+            # not visible. The key is one-time and expires after ten minutes.
+            pairing = self._make_remote_key()
+            if pairing:
+                url, key, auto_url, manual = pairing
+                phone_url = self._dashboard.get_phone_url()
+                print(
+                    "[JARVIS PHONE] Pairing ready\n"
+                    f"  Core URL: {url}\n"
+                    f"  Android LAN URL: {phone_url}\n"
+                    f"  Pairing key: {key}\n"
+                    f"  Key expires in: 10 minutes\n"
+                    "  Enter the Core URL and key in the Android app."
+                )
+                self.ui.write_log(
+                    f"SYS: Phone pairing ready — Android URL {phone_url} — key {key} "
+                    "(expires in 10 minutes)"
+                )
         except Exception as e:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None

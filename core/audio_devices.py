@@ -203,6 +203,9 @@ def configure(input_rate: int, output_rate: int) -> None:
     global _cache
     _RATES["input"]  = int(input_rate)
     _RATES["output"] = int(output_rate)
+    _probe_results.clear()
+    _chosen_api["input"] = None
+    _chosen_api["output"] = None
     with _cache_lock:
         _cache = None
 
@@ -336,6 +339,12 @@ def list_devices(kind: str, refresh: bool = False) -> list[str]:
     """Device names for 'input' or 'output'. Falls back to a synchronous query
     if the prefetch has not landed yet — correctness over the cache."""
     global _cache
+    if refresh:
+        # Bluetooth and USB endpoints can appear after startup. The transport
+        # probe is also invalid once the host device graph changes.
+        _probe_results.clear()
+        _chosen_api["input"] = None
+        _chosen_api["output"] = None
     with _cache_lock:
         cached = None if refresh else _cache
     if cached is None:
@@ -386,9 +395,15 @@ def resolve(name: str, kind: str):
 
         # The API the picker settled on for this direction comes first — the
         # endpoint that was listed must be the endpoint that gets opened, or the
-        # setting means something different from what it says. list_devices()
-        # populates it; calling it here is a no-op once the cache is warm.
-        list_devices(kind)
+        # setting means something different from what it says. Refresh only when
+        # a saved device is absent so a Bluetooth endpoint connected after
+        # startup is visible without probing on every stream open.
+        listed = list_devices(kind)
+        if wanted not in listed and not any(
+            name.startswith(wanted[:24]) or wanted.startswith(name[:24])
+            for name in listed if name
+        ):
+            list_devices(kind, refresh=True)
         chosen = _chosen_api.get(kind)
         orders = ([chosen] if chosen is not None else []) \
             + [a for a in _PREFERRED_APIS.get(platform.system(), ()) if a != chosen] \

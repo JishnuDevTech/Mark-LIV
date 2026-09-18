@@ -1,0 +1,10 @@
+import * as vscode from 'vscode';
+import { JarvisBridge } from './bridge';
+import { WorkspaceContextProvider } from './context';
+import { AssistantView } from './webview';
+export function registerCommands(ctx:vscode.ExtensionContext,bridge:JarvisBridge,provider:WorkspaceContextProvider,view:AssistantView){
+ const run=async (id:string, action:()=>Promise<void>)=>ctx.subscriptions.push(vscode.commands.registerCommand(id,()=>void action().catch(e=>vscode.window.showErrorMessage(`JARVIS: ${e instanceof Error?e.message:e}`))));
+ const send=async(text:string,contents=true)=>{const c=await provider.getContext(contents);view.setContext(c);await bridge.command(text,c);vscode.window.showInformationMessage(`JARVIS command sent: ${text}`);};
+ void run('jarvis.openAssistant',async()=>vscode.commands.executeCommand('workbench.view.extension.jarvis')); void run('jarvis.analyzeWorkspace',()=>send('Analyze this workspace')); void run('jarvis.explainSelection',()=>send('Explain the current selection')); void run('jarvis.reviewFile',()=>send('Review the active file')); void run('jarvis.reviewChanges',()=>send('Review my current changes')); void run('jarvis.fixDiagnostics',()=>send('Fix the current diagnostics')); void run('jarvis.continueTask',()=>send('Continue the current task',false)); void run('jarvis.stopCurrentTask',async()=>{await bridge.control('stop_task');}); void run('jarvis.showProjectContext',async()=>{const c=await provider.getContext(false);view.setContext(c);const doc=await vscode.workspace.openTextDocument({language:'json',content:JSON.stringify(c,null,2)});await vscode.window.showTextDocument(doc,{preview:true});}); void run('jarvis.runTests',async()=>runWorkspaceTask('test')); void run('jarvis.runBuild',async()=>runWorkspaceTask('build'));
+ async function runWorkspaceTask(kind:string){const tasks=await vscode.tasks.fetchTasks();const found=tasks.find(t=>new RegExp(`(^|:)${kind}$|${kind}`,'i').test(t.name));if(found){await vscode.tasks.executeTask(found);return;}const command=kind==='test'?'npm test':'npm run build';const terminal=vscode.window.createTerminal(`JARVIS ${kind}`);terminal.show();terminal.sendText(command);}
+}

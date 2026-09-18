@@ -30,6 +30,16 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # Audio playback helpers
 # ---------------------------------------------------------------------------
 
+def _selected_output_device():
+    """Resolve JARVIS's persisted speaker choice for every TTS backend."""
+    try:
+        from core.audio_devices import resolve
+        from memory.config_manager import get_output_device
+        return resolve(get_output_device(), "output")
+    except Exception as exc:
+        print(f"[TTS] Could not resolve selected output device: {exc}")
+        return None
+
 def _to_numpy(samples) -> np.ndarray:
     """Convert samples to float32 numpy array.
 
@@ -81,7 +91,7 @@ def _play_np(samples, sample_rate: int) -> None:
     """Play float32 mono (or stereo) audio via sounddevice.
     Accepts numpy arrays or PyTorch tensors.
     """
-    sd.play(_to_numpy(samples), sample_rate)
+    sd.play(_to_numpy(samples), sample_rate, device=_selected_output_device())
     sd.wait()
 
 
@@ -94,7 +104,7 @@ def _play_audio_bytes(audio_bytes: bytes) -> None:
         nchannels=1,
     )
     samples = np.array(decoded.samples, dtype=np.float32)
-    sd.play(samples, decoded.sample_rate)
+    sd.play(samples, decoded.sample_rate, device=_selected_output_device())
     sd.wait()
 
 
@@ -440,3 +450,24 @@ def create_tts_player(config: dict) -> TTSPlayer:
         voice  = config.get("tts_voice", "en-US-GuyNeural")
         engine = EdgeTTSEngine(voice=voice)
     return TTSPlayer(engine)
+
+
+def create_agent_tts_player(agent: str, config: dict | None = None) -> TTSPlayer:
+    """Create an isolated specialist voice, without changing JARVIS's player.
+
+    Specialist defaults are intentionally local and may be overridden by the
+    caller.  The regular ``create_tts_player`` path remains the sole source of
+    truth for the main assistant voice.
+    """
+    from core.specialist_agents import DEFAULT_AGENT_VOICES
+
+    name = str(agent or "").upper()
+    selected = dict(DEFAULT_AGENT_VOICES.get(name, DEFAULT_AGENT_VOICES["MESSENGER"]))
+    selected.update({key: value for key, value in dict(config or {}).items()
+                     if key in {"engine", "voice", "speed", "elevenlabs_api_key"}})
+    return create_tts_player({
+        "tts_engine": selected["engine"],
+        "tts_voice": selected["voice"],
+        "tts_speed": selected.get("speed", 1.0),
+        "elevenlabs_api_key": selected.get("elevenlabs_api_key", ""),
+    })

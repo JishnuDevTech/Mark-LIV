@@ -46,6 +46,9 @@ class PluginRecord:
     settings: Optional[dict] = None   # optional PLUGIN_SETTINGS schema (config fields)
     behavior: Optional[str] = None    # None = the API's default (blocking)
     scheduling: Optional[str] = None  # None = the API's default (WHEN_IDLE)
+    provider: str = ""
+    permissions: list[str] = field(default_factory=list)
+    module: object | None = None
 
 
 class PluginRegistry:
@@ -135,6 +138,9 @@ class PluginRegistry:
                 "valid": rec.valid,
                 "error": rec.error,
                 "enabled": get_plugin_enabled(rec.name) if rec.valid else False,
+                "provider": rec.provider,
+                "permissions": list(rec.permissions),
+                "connection": "configured" if rec.settings else "not_configured",
             })
         return out
 
@@ -189,7 +195,10 @@ def _validate(module, filename: str) -> PluginRecord:
     return PluginRecord(name=name, description=description.strip(), parameters=parameters,
                          run=run_fn, file=filename, valid=True, error="", settings=settings,
                          behavior=_opt_upper(plugin_meta.get("behavior"), _BEHAVIORS),
-                         scheduling=_opt_upper(plugin_meta.get("scheduling"), _SCHEDULING))
+                         scheduling=_opt_upper(plugin_meta.get("scheduling"), _SCHEDULING),
+                         provider=str(plugin_meta.get("provider", "")),
+                         permissions=[str(p) for p in plugin_meta.get("permissions", []) if p],
+                         module=module)
 
 
 def _load_error(path: Path, plugins_dir: Path, exc: Exception) -> str:

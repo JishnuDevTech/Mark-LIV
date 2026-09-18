@@ -38,10 +38,28 @@ def load_api_keys() -> dict:
     if not CONFIG_FILE.exists():
         return {}
     try:
-        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"❌ Failed to load api_keys.json: {e}")
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"❌ Failed to load api_keys.json: {exc}")
         return {}
+    return data if isinstance(data, dict) else {}
+
+
+def get_preferences() -> dict:
+    """Return persisted behaviour/communication preferences."""
+    value = load_api_keys().get("preferences", {})
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def save_preferences(values: dict) -> None:
+    """Merge behaviour/communication preferences into the existing config."""
+    ensure_config_dir()
+    data = load_api_keys()
+    current = data.get("preferences", {})
+    current = dict(current) if isinstance(current, dict) else {}
+    current.update(values or {})
+    data["preferences"] = current
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
 def get_gemini_key() -> str | None:
     return load_api_keys().get("gemini_api_key")
@@ -338,7 +356,16 @@ def get_plugin_config(namespace: str) -> dict:
     """All stored values for a namespace (empty dict if none set yet)."""
     cfg = load_api_keys().get("plugin_config")
     val = cfg.get(namespace) if isinstance(cfg, dict) else None
-    return dict(val) if isinstance(val, dict) else {}
+    values = dict(val) if isinstance(val, dict) else {}
+    try:
+        from core.credentials import get_secret
+        secret_keys = values.pop("__secret_keys__", [])
+        for key in secret_keys:
+            if _is_secret_key(key):
+                values[key] = get_secret(namespace, key)
+    except Exception:
+        pass
+    return values
 
 
 def get_plugin_setting(namespace: str, key: str, default=None):
@@ -362,7 +389,28 @@ def save_plugin_config(namespace: str, values: dict) -> None:
     cur = pc.get(namespace)
     if not isinstance(cur, dict):
         cur = {}
-    cur.update(values)
+    safe_values = {}
+    for key, value in (values or {}).items():
+        if _is_secret_key(key):
+            try:
+                from core.credentials import set_secret
+                if set_secret(namespace, key, str(value or "")):
+                    continue
+            except Exception:
+                pass
+        safe_values[key] = value
+    cur.update(safe_values)
+    secret_keys = set(cur.get("__secret_keys__", []))
+    for key, value in (values or {}).items():
+        if _is_secret_key(key):
+            try:
+                from core.credentials import set_secret
+                if set_secret(namespace, key, str(value or "")):
+                    secret_keys.add(key)
+            except Exception:
+                pass
+    if secret_keys:
+        cur["__secret_keys__"] = sorted(secret_keys)
     pc[namespace] = cur
     data["plugin_config"] = pc
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
@@ -382,3 +430,25 @@ def save_plugin_enabled(plugin_name: str, enabled: bool) -> None:
     plugins_cfg[plugin_name] = enabled
     data["plugins_enabled"] = plugins_cfg
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_plugin_permissions(plugin_name: str) -> set[str]:
+    permissions = load_api_keys().get("plugin_permissions", {})
+    values = permissions.get(plugin_name, []) if isinstance(permissions, dict) else []
+    return {str(value).upper() for value in values}
+
+
+def save_plugin_permissions(plugin_name: str, permissions) -> None:
+    ensure_config_dir()
+    data = load_api_keys()
+    current = data.get("plugin_permissions")
+    if not isinstance(current, dict):
+        current = {}
+    current[plugin_name] = sorted({str(value).upper() for value in (permissions or [])})
+    data["plugin_permissions"] = current
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def _is_secret_key(key: str) -> bool:
+    lowered = str(key).lower()
+    return any(token in lowered for token in ("password", "token", "secret", "api_key", "access_key", "private_key"))

@@ -11,12 +11,15 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import json
+import inspect
 import re
 import secrets
 import socket
 import string
 import time
 from pathlib import Path
+from core import device_manager
 
 _DEPS_OK = False
 try:
@@ -38,6 +41,7 @@ except Exception:
 BASE_DIR    = Path(__file__).resolve().parent.parent
 STATIC_DIR  = Path(__file__).parent / "static"
 PORT        = 8000
+PHONE_HTTP_PORT = 8002
 MAX_UPLOAD_MB = 500
 
 
@@ -459,8 +463,10 @@ class DashboardServer:
         self._ip                          = _local_ip()
         self._tokens: set[str]            = set()
         self._token_keys: dict[str, str]  = {}   # auth_token → session_key
+        self._token_devices: dict[str, str] = {} # auth_token → device_id
         self._aes_cache:  dict[str, bytes]= {}   # session_key → AES bytes
         self._clients: set[WebSocket]     = set()
+        self._client_devices: dict[WebSocket, str] = {}
         self._history: list[dict]         = []
         self._command_queue               = asyncio.Queue()
         self._wake_callback               = None
@@ -468,6 +474,15 @@ class DashboardServer:
         self._pending_keys: dict[str, float] = {}
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
+        self._phone_audio_clients: set[WebSocket] = set()
+        self._state_callback = None
+        # Optional hooks are supplied by the core when a setting has a real
+        # owner.  The dashboard never keeps a second copy of control state.
+        self._control_callback = None
+        self._capability_callback = None
+        self._device_callback = None
+        self._device_telemetry_callback = None
+        self._device_results: dict[str, asyncio.Future] = {}
         self._uploads_dir                 = UPLOADS_DIR
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
@@ -497,6 +512,10 @@ class DashboardServer:
             return f"{self._ip}:{PORT + 1}"
         return f"{self._ip}:{PORT}"
 
+    def get_phone_url(self) -> str:
+        """LAN-only URL that avoids self-signed TLS rejection on Android."""
+        return f"http://{self._ip}:{PHONE_HTTP_PORT}"
+
     def _aes_key(self, session_key: str) -> bytes:
         if session_key not in self._aes_cache:
             self._aes_cache[session_key] = _derive_key(session_key)
@@ -519,6 +538,168 @@ class DashboardServer:
     def set_connect_callback(self, fn) -> None:
         self._connect_callback = fn
 
+    def set_state_callback(self, fn) -> None:
+        self._state_callback = fn
+
+    def set_control_callback(self, fn) -> None:
+        """Bind control writes to an existing core API.
+
+        A missing callback is intentional: controls are reported as
+        unsupported rather than appearing to work against dashboard-local
+        state.
+        """
+        self._control_callback = fn
+
+    def set_capability_callback(self, fn) -> None:
+        """Bind capability registration to the core-owned registry/state."""
+        self._capability_callback = fn
+
+    def set_device_callback(self, fn) -> None:
+        self._device_callback = fn
+
+    def set_device_telemetry_callback(self, fn) -> None:
+        self._device_telemetry_callback = fn
+
+    async def send_to_device(self, device_id: str, message: dict) -> bool:
+        """Send a structured message only to sessions belonging to device_id."""
+        sent = False
+        for ws, ws_device in list(getattr(self, "_client_devices", {}).items()):
+            if ws_device != device_id:
+                continue
+            try:
+                await ws.send_json(message)
+                sent = True
+            except Exception:
+                self._clients.discard(ws)
+        return sent
+
+    async def request_device_action(self, device_id: str, message: dict,
+                                   request_id: str, timeout: float = 8.0) -> tuple[bool, dict]:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._device_results[request_id] = future
+        sent = await self.send_to_device(device_id, message)
+        if not sent:
+            self._device_results.pop(request_id, None)
+            return False, {"ok": False, "error": "device is not connected"}
+        try:
+            return True, await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            return False, {"ok": False, "error": "device acknowledgement timed out"}
+        finally:
+            self._device_results.pop(request_id, None)
+
+    def _phone_state(self) -> dict:
+        try:
+            value = self._state_callback() if self._state_callback else {}
+            return value if isinstance(value, dict) else {}
+        except Exception as exc:
+            print(f"[Dashboard] State sync failed: {exc}")
+            return {"error": "state unavailable"}
+
+    def _control_surface(self, state: dict) -> dict:
+        controls = state.get("controls")
+        if isinstance(controls, dict):
+            return controls
+        return {
+            "autonomy": {"supported": False},
+            "notification_preferences": {"supported": False},
+            "agents": {"supported": False},
+            "plugins": {"supported": False},
+            "devices": {"supported": False},
+        }
+
+    def _dashboard_state(self, limit: int = 50, device_id: str = "default") -> dict:
+        """Compose a read-only dashboard view from the core's existing state.
+
+        Missing values remain ``None``/empty; they are not inferred or
+        persisted here.  This makes the API useful with both the current core
+        and a future central state callback.
+        """
+        state = self._phone_state()
+        if not isinstance(state, dict):
+            state = {}
+        # The current core exposes its managers through the bound state
+        # callback.  Read those existing registries when available; do not
+        # cache or mirror them in the dashboard.
+        owner = getattr(self._state_callback, "__self__", None)
+        if owner is not None:
+            agents = getattr(owner, "_agent_manager", None)
+            if agents is not None and "agents" not in state:
+                try:
+                    state["agents"] = agents.list()
+                except Exception:
+                    pass
+            if agents is not None:
+                try:
+                    state["agent_tasks"] = agents.tasks(limit)
+                    state["agent_communications"] = agents.communications(limit)
+                except Exception:
+                    state.setdefault("agent_tasks", [])
+                    state.setdefault("agent_communications", [])
+            plugins = getattr(owner, "_plugin_manager", None)
+            if plugins is not None and not state.get("plugins"):
+                try:
+                    state["plugins"] = plugins.list_for_ui()
+                except Exception:
+                    pass
+            mobile_manager = getattr(owner, "_mobile_capabilities", None)
+            if mobile_manager is not None and "devices" not in state:
+                try:
+                    state["devices"] = mobile_manager.connected_devices()
+                except Exception:
+                    pass
+        limit = max(1, min(int(limit or 50), 200))
+        active_task = state.get("active_task")
+        tasks = state.get("tasks")
+        if not isinstance(tasks, list):
+            tasks = []
+        background = state.get("background_tasks")
+        if not isinstance(background, list):
+            background = [task for task in tasks if task != active_task]
+        mobile = state.get("mobile")
+        devices = state.get("devices")
+        if not isinstance(devices, list):
+            devices = (
+                mobile.get("connected_devices", [])
+                if isinstance(mobile, dict) else []
+            )
+        try:
+            from core import event_engine
+            events = state.get("events")
+            if not isinstance(events, list):
+                events = event_engine.recent(limit)
+            notifications = state.get("notifications")
+            if not isinstance(notifications, list):
+                notifications = event_engine.pending_for_device(device_id, limit)
+        except Exception:
+            events, notifications = [], []
+        return {
+            "jarvis": {
+                "status": state.get("jarvis_status"),
+                "active_task": active_task,
+                "active_project": state.get("active_project"),
+            },
+            "tasks": {"active": active_task, "background": background[:limit],
+                      "items": tasks[:limit]},
+            "agents": state.get("agents", []),
+            "agent_hierarchy": state.get("agent_hierarchy", [
+                {"name": "JARVIS", "role": "orchestrator", "parent": None,
+                 "children": [row.get("name") for row in state.get("agents", [])]},
+            ]),
+            "agent_tasks": state.get("agent_tasks", []),
+            "agent_communications": state.get("agent_communications", []),
+            "devices": devices[:limit],
+            "plugins": state.get("plugins", []),
+            "provider": state.get("provider"),
+            "events": events,
+            "notifications": notifications,
+            "autonomy": state.get("autonomy"),
+            "goals": state.get("goals", []),
+            "health": state.get("health"),
+            "controls": self._control_surface(state),
+        }
+
     # ── broadcast ────────────────────────────────────────────────────────
 
     async def broadcast(self, msg: dict) -> None:
@@ -532,6 +713,16 @@ class DashboardServer:
             except Exception:
                 dead.add(ws)
         self._clients -= dead
+
+    async def broadcast_phone_audio(self, data: bytes) -> None:
+        """Send response PCM only to authenticated phone audio clients."""
+        dead = set()
+        for ws in list(self._phone_audio_clients):
+            try:
+                await ws.send_bytes(data)
+            except Exception:
+                dead.add(ws)
+        self._phone_audio_clients -= dead
 
     # ── FastAPI app ───────────────────────────────────────────────────────
 
@@ -573,8 +764,12 @@ class DashboardServer:
             if entered in self._pending_keys and self._pending_keys[entered] > now:
                 del self._pending_keys[entered]          # one-time use
                 tok = secrets.token_urlsafe(32)
+                paired = device_manager.register(entered)
+                dev_tok, device_id = paired if paired else (secrets.token_urlsafe(32), secrets.token_urlsafe(12))
                 self._tokens.add(tok)
                 self._token_keys[tok] = entered
+                self._token_devices[tok] = device_id
+                self._device_sessions[dev_tok] = {"session_key": entered, "device_id": device_id}
                 self._aes_key(entered)                   # pre-derive & cache
                 if self._connect_callback:
                     self._connect_callback()
@@ -582,7 +777,7 @@ class DashboardServer:
                     {"type": "sys", "text": "Remote connection established."}
                 ))
                 # Bearer token in response body — no cookies needed (works on any browser/HTTP)
-                return JSONResponse({"ok": True, "token": tok})
+                return JSONResponse({"ok": True, "token": tok, "device_token": dev_tok, "device_id": device_id, "key": entered})
             return JSONResponse({"ok": False, "error": "Invalid or expired key"},
                                 status_code=401)
 
@@ -604,11 +799,13 @@ class DashboardServer:
 
             del self._pending_keys[key]
             tok     = secrets.token_urlsafe(32)
-            dev_tok = secrets.token_urlsafe(32)
+            paired = device_manager.register(key)
+            dev_tok, device_id = paired if paired else (secrets.token_urlsafe(32), secrets.token_urlsafe(12))
             self._tokens.add(tok)
             self._token_keys[tok] = key
+            self._token_devices[tok] = device_id
             self._aes_key(key)
-            self._device_sessions[dev_tok] = {"session_key": key}
+            self._device_sessions[dev_tok] = {"session_key": key, "device_id": device_id}
 
             if self._connect_callback:
                 self._connect_callback()
@@ -641,28 +838,247 @@ class DashboardServer:
             except Exception:
                 return JSONResponse({"ok": False}, status_code=400)
             dev_tok = (body.get("device_token") or "").strip()
-            if not dev_tok or dev_tok not in self._device_sessions:
-                return JSONResponse({"ok": False}, status_code=401)
-            session_key = self._device_sessions[dev_tok]["session_key"]
+            stored = self._device_sessions.get(dev_tok)
+            if stored:
+                session_key = stored["session_key"]
+                device_id = stored.get("device_id", dev_tok[:12])
+            else:
+                resolved = device_manager.resolve(dev_tok)
+                if not resolved:
+                    return JSONResponse({"ok": False}, status_code=401)
+                session_key, device_id = resolved
             tok = secrets.token_urlsafe(32)
             self._tokens.add(tok)
             self._token_keys[tok] = session_key
+            self._token_devices[tok] = device_id
             self._aes_key(session_key)
             if self._connect_callback:
                 self._connect_callback()
             asyncio.create_task(self.broadcast(
                 {"type": "sys", "text": "Known device reconnected automatically."}
             ))
-            return JSONResponse({"ok": True, "token": tok, "key": session_key})
+            return JSONResponse({"ok": True, "token": tok, "key": session_key, "device_id": device_id})
 
         @app.post("/api/revoke-devices")
         async def revoke_devices(req: Request):
             """Invalidate all persistent device tokens (admin action)."""
             if not _auth(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            count = len(self._device_sessions)
+            count = device_manager.revoke_all()
             self._device_sessions.clear()
             return JSONResponse({"ok": True, "revoked": count})
+
+        @app.get("/api/phone/state")
+        async def phone_state(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            return JSONResponse({"ok": True, "state": self._phone_state()})
+
+        # ── Control-center read model ───────────────────────────────────
+        # These endpoints intentionally share one snapshot so dashboard
+        # panels cannot drift from one another or create their own stores.
+        def _dashboard_auth(req: Request):
+            if not _auth(req):
+                return None, JSONResponse({"error": "Unauthorized"}, status_code=401)
+            token = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
+            return self._token_devices.get(token, "default"), None
+
+        @app.get("/api/state")
+        @app.get("/api/dashboard/state")
+        async def dashboard_state(req: Request, limit: int = 50):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            return JSONResponse({"ok": True, "state": self._dashboard_state(limit, device_id)})
+
+        @app.get("/api/status")
+        async def dashboard_status(req: Request):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            state = self._dashboard_state(1, device_id)
+            return JSONResponse({"ok": True, "jarvis": state["jarvis"],
+                                 "health": state["health"]})
+
+        @app.get("/api/tasks")
+        async def dashboard_tasks(req: Request, limit: int = 50):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            return JSONResponse({"ok": True, "tasks": self._dashboard_state(limit, device_id)["tasks"]})
+
+        @app.get("/api/agents")
+        async def dashboard_agents(req: Request):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            return JSONResponse({"ok": True, "agents": self._dashboard_state(50, device_id)["agents"]})
+
+        @app.get("/api/agent-communications")
+        async def dashboard_agent_communications(req: Request, limit: int = 50):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            view = self._dashboard_state(limit, device_id)
+            return JSONResponse({"ok": True, "communications": view["agent_communications"]})
+
+        @app.get("/api/agent-tasks")
+        async def dashboard_agent_tasks(req: Request, limit: int = 50):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            view = self._dashboard_state(limit, device_id)
+            return JSONResponse({"ok": True, "tasks": view["agent_tasks"]})
+
+        @app.post("/api/agents/{agent_name}/voice")
+        async def dashboard_agent_voice(agent_name: str, req: Request):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            owner = getattr(self._state_callback, "__self__", None)
+            manager = getattr(owner, "_agent_manager", None) if owner is not None else None
+            if manager is None:
+                return JSONResponse({"ok": False, "error": "Agent manager unavailable"}, status_code=503)
+            try:
+                config = await req.json()
+                voice = manager.set_voice_config(agent_name, config)
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            return JSONResponse({"ok": True, "agent": agent_name.upper(), "voice_config": voice})
+
+        @app.get("/api/devices")
+        async def dashboard_devices(req: Request):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            return JSONResponse({"ok": True, "devices": self._dashboard_state(50, device_id)["devices"]})
+
+        @app.get("/api/plugins")
+        async def dashboard_plugins(req: Request):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            return JSONResponse({"ok": True, "plugins": self._dashboard_state(50, device_id)["plugins"]})
+
+        @app.get("/api/provider")
+        async def dashboard_provider(req: Request):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            return JSONResponse({"ok": True, "provider": self._dashboard_state(1, device_id)["provider"]})
+
+        @app.get("/api/events")
+        async def dashboard_events(req: Request, limit: int = 50):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            return JSONResponse({"ok": True, "events": self._dashboard_state(limit, device_id)["events"]})
+
+        @app.get("/api/notifications")
+        async def dashboard_notifications(req: Request, limit: int = 50):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            return JSONResponse({"ok": True, "notifications": self._dashboard_state(limit, device_id)["notifications"]})
+
+        @app.get("/api/autonomy")
+        async def dashboard_autonomy(req: Request):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            return JSONResponse({"ok": True, "autonomy": self._dashboard_state(1, device_id)["autonomy"]})
+
+        @app.get("/api/goals")
+        async def dashboard_goals(req: Request):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            return JSONResponse({"ok": True, "goals": self._dashboard_state(50, device_id)["goals"]})
+
+        @app.get("/api/health")
+        async def dashboard_health(req: Request):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            return JSONResponse({"ok": True, "health": self._dashboard_state(1, device_id)["health"]})
+
+        @app.get("/api/controls")
+        async def dashboard_controls(req: Request):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            return JSONResponse({"ok": True, "controls": self._dashboard_state(1, device_id)["controls"]})
+
+        @app.post("/api/controls")
+        async def dashboard_control(req: Request):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            if not self._control_callback:
+                return JSONResponse(
+                    {"ok": False, "error": "No core control API is available."},
+                    status_code=501,
+                )
+            try:
+                body = await req.json()
+                control = str(body.get("control") or "").strip()
+                if not control:
+                    return JSONResponse({"ok": False, "error": "control is required"}, status_code=400)
+                result = self._control_callback(control, body.get("value"))
+                if inspect.isawaitable(result):
+                    result = await result
+                return JSONResponse({"ok": True, "control": control, "result": result})
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+        @app.post("/api/capabilities/register")
+        async def register_capabilities(req: Request):
+            device_id, denied = _dashboard_auth(req)
+            if denied:
+                return denied
+            if not self._capability_callback:
+                return JSONResponse(
+                    {"ok": False, "error": "No core capability registry is available."},
+                    status_code=501,
+                )
+            try:
+                body = await req.json()
+                capabilities = body.get("capabilities", [])
+                if not isinstance(capabilities, list):
+                    return JSONResponse(
+                        {"ok": False, "error": "capabilities must be an array"},
+                        status_code=400,
+                    )
+                result = self._capability_callback(
+                    [str(item).strip() for item in capabilities if str(item).strip()],
+                    source=str(body.get("source") or "vscode"),
+                    device_id=device_id,
+                    metadata=body.get("metadata") if isinstance(body.get("metadata"), dict) else {},
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+                return JSONResponse({"ok": True, "result": result})
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+        @app.get("/api/phone/events")
+        async def phone_events(req: Request, limit: int = 50):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            from core import event_engine
+            device_id = self._token_devices.get(req.headers.get("authorization", "").removeprefix("Bearer ").strip(), "default")
+            return JSONResponse({"ok": True, "events": event_engine.pending_for_device(device_id, limit)})
+
+        @app.post("/api/phone/events/ack")
+        async def phone_events_ack(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            body = await req.json()
+            token = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
+            device_id = self._token_devices.get(token, "default")
+            from core import event_engine
+            event_engine.mark_delivered(body.get("event_ids", []), device_id)
+            return JSONResponse({"ok": True})
 
         @app.post("/api/command")
         async def command(req: Request):
@@ -700,6 +1116,7 @@ class DashboardServer:
                 await websocket.close(code=4001)
                 return
             await websocket.accept()
+            self._phone_audio_clients.add(websocket)
             asyncio.create_task(self.broadcast(
                 {"type": "sys", "text": "Phone microphone live."}
             ))
@@ -715,6 +1132,7 @@ class DashboardServer:
             except WebSocketDisconnect:
                 pass
             finally:
+                self._phone_audio_clients.discard(websocket)
                 asyncio.create_task(self.broadcast(
                     {"type": "sys", "text": "Phone microphone stopped."}
                 ))
@@ -815,14 +1233,40 @@ class DashboardServer:
                 return
             await websocket.accept()
             self._clients.add(websocket)
+            self._client_devices[websocket] = self._token_devices.get(tok, "default")
+            if self._device_callback:
+                self._device_callback(self._client_devices[websocket], True)
             for entry in self._history[-50:]:
                 try:
                     await websocket.send_json(entry)
                 except Exception:
                     break
             try:
+                from core import event_engine
+                device_id = self._token_devices.get(tok, "default")
+                for event in event_engine.pending_for_device(device_id, 50):
+                    await websocket.send_json({"type": "event", "event": event})
+            except Exception:
+                pass
+            try:
                 while True:
                     data = await websocket.receive_json()
+                    if data.get("type") == "mobile_result":
+                        request_id = str(data.get("request_id", ""))
+                        future = self._device_results.get(request_id)
+                        if future and not future.done():
+                            future.set_result({
+                                "ok": bool(data.get("ok", False)),
+                                "error": data.get("error"),
+                            })
+                        continue
+                    if data.get("type") == "mobile_telemetry":
+                        if self._device_telemetry_callback:
+                            self._device_telemetry_callback(
+                                self._client_devices.get(websocket, "default"),
+                                data.get("telemetry") or {},
+                            )
+                        continue
                     if data.get("type") == "command":
                         enc = data.get("enc", "")
                         t   = self._decrypt(tok, enc) if enc else (data.get("text") or "").strip()
@@ -834,6 +1278,10 @@ class DashboardServer:
                 pass
             finally:
                 self._clients.discard(websocket)
+                device_id = getattr(self, "_client_devices", {}).pop(websocket, "default")
+                still_connected = device_id in self._client_devices.values()
+                if self._device_callback and not still_connected:
+                    self._device_callback(device_id, False)
 
         return app
 
@@ -851,6 +1299,25 @@ class DashboardServer:
             ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
         )
         print(f"[Dashboard] Manual entry:  {self._ip}:{PORT + 1}  (type in browser, accept cert once)")
+        await uvicorn.Server(cfg).serve()
+
+    async def _serve_phone_http(self) -> None:
+        """Optional LAN fallback for Android devices that reject local TLS.
+
+        Authentication still requires the one-time pairing key/bearer token.
+        This endpoint is intended only for a trusted private LAN; HTTPS remains
+        the preferred transport for remote or untrusted networks.
+        """
+        asyncio.get_event_loop().run_in_executor(
+            None, _ensure_network_access, PHONE_HTTP_PORT
+        )
+        cfg = uvicorn.Config(
+            self.app, host="0.0.0.0", port=PHONE_HTTP_PORT, log_level="warning"
+        )
+        print(
+            f"[Dashboard] Android LAN fallback: http://{self._ip}:{PHONE_HTTP_PORT} "
+            "(private network only)"
+        )
         await uvicorn.Server(cfg).serve()
 
     async def serve(self) -> None:
@@ -872,6 +1339,7 @@ class DashboardServer:
 
         if use_ssl:
             asyncio.create_task(self._serve_alias())
+            asyncio.create_task(self._serve_phone_http())
 
         cfg = uvicorn.Config(
             self.app, host="0.0.0.0", port=PORT, log_level="warning",
@@ -880,5 +1348,10 @@ class DashboardServer:
 
         proto = "https" if use_ssl else "http"
         print(f"[Dashboard] {proto}://{self._ip}:{PORT}")
+        if use_ssl:
+            print(
+                f"[Dashboard] Phone URL (LAN fallback): "
+                f"http://{self._ip}:{PHONE_HTTP_PORT}"
+            )
         print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
         await uvicorn.Server(cfg).serve()

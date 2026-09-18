@@ -51,6 +51,26 @@
     .enc-badge.off { display: block; background: rgba(255,100,100,0.08); border: 1px solid rgba(255,100,100,0.2); color: #f87171; }
     .url { font-size: 10px; font-family: monospace; color: var(--muted); padding: 4px 9px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
 
+    /* ── AGENT CONTROL CENTER ── */
+    .agent-center { display:grid; grid-template-columns:minmax(240px,1.2fr) minmax(220px,1fr); gap:10px; flex-shrink:0; }
+    .agent-panel { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:11px; min-width:0; }
+    .panel-title { color:var(--muted); font-size:9px; font-weight:700; letter-spacing:1.8px; text-transform:uppercase; margin-bottom:9px; }
+    .agent-tree { display:flex; gap:7px; flex-wrap:wrap; align-items:center; }
+    .agent-card { flex:1 1 125px; min-width:110px; border:1px solid rgba(99,102,241,.25); border-radius:9px; padding:8px; background:rgba(99,102,241,.08); }
+    .agent-card.root { flex-basis:100%; border-color:rgba(34,197,94,.3); background:var(--gdim); }
+    .agent-name { font-size:11px; font-weight:700; letter-spacing:1px; }
+    .agent-role { color:var(--muted); font-size:10px; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .agent-meta { color:var(--accent); font-size:9px; margin-top:6px; }
+    .monitor-list { max-height:106px; overflow:auto; display:flex; flex-direction:column; gap:5px; }
+    .monitor-row { display:flex; gap:7px; align-items:center; font-size:10px; color:var(--muted); }
+    .monitor-row strong { color:var(--text); font-size:10px; }
+    .monitor-dot { width:6px; height:6px; border-radius:50%; background:var(--green); flex:none; }
+    .monitor-dot.failed { background:#f87171; }
+    .comms { max-height:120px; overflow:auto; display:flex; flex-direction:column; gap:5px; }
+    .comm-row { border-left:2px solid var(--accent); padding-left:7px; font-size:10px; line-height:1.35; }
+    .comm-row time { color:var(--muted); margin-left:5px; }
+    @media (max-width:700px) { .agent-center { grid-template-columns:1fr; } }
+
     /* ── FEED ── */
     main { flex: 1; overflow-y: auto; padding: 14px 16px 8px; display: flex; flex-direction: column; gap: 10px; }
     main::-webkit-scrollbar { width: 3px; }
@@ -142,7 +162,22 @@
     <div class="spacer"></div>
     <div class="url">__IP__:__PORT__</div>
   </header>
-  <main id="feed"></main>
+  <main id="feed">
+    <section class="agent-center" aria-label="Agent control center">
+      <div class="agent-panel">
+        <div class="panel-title">Agent hierarchy</div>
+        <div id="agent-tree" class="agent-tree"><div class="agent-role">Loading specialists…</div></div>
+      </div>
+      <div class="agent-panel">
+        <div class="panel-title">Task monitoring</div>
+        <div id="agent-tasks" class="monitor-list"><div class="agent-role">No active specialist tasks</div></div>
+      </div>
+      <div class="agent-panel" style="grid-column:1/-1">
+        <div class="panel-title">Live agent communication</div>
+        <div id="agent-comms" class="comms"><div class="agent-role">Waiting for agent events…</div></div>
+      </div>
+    </section>
+  </main>
   <footer>
     <input id="inp" placeholder="Send a command to JARVIS…" autocomplete="off">
     <label class="btn-attach" for="file-inp" title="Send file">📎</label>
@@ -220,7 +255,26 @@
       if (m.type === 'wake')          sys('Wake word detected — connecting…');
       if (m.type === 'sys')           sys(m.text);
       if (m.type === 'file_received') _onFileReceived(m);
+      if (m.type === 'event' || m.type === 'dashboard_state') refreshAgentCenter(m.state || null);
     };
+
+    function refreshAgentCenter(input) {
+      const apply = view => {
+        if (!view) return;
+        const agents = view.agents || [];
+        const tree = document.getElementById('agent-tree');
+        tree.innerHTML = `<div class="agent-card root"><div class="agent-name">JARVIS</div><div class="agent-role">orchestrator</div><div class="agent-meta">${agents.length} specialists</div></div>` +
+          agents.map(a => `<div class="agent-card"><div class="agent-name">${esc(a.name || 'Agent')}</div><div class="agent-role">${esc((a.metadata || {}).role || a.description || 'specialist')}</div><div class="agent-meta">${a.healthy ? '● online' : '○ offline'} · ${esc(((a.voice_config || {}).voice || a.voice || 'default'))}</div></div>`).join('');
+        const tasks = view.agent_tasks || [];
+        document.getElementById('agent-tasks').innerHTML = tasks.length ? tasks.map(t => `<div class="monitor-row"><span class="monitor-dot ${t.status === 'failed' ? 'failed' : ''}"></span><strong>${esc(t.agent || 'agent')}</strong><span>${esc(t.task?.objective || t.task_id || 'task')}</span><span>${esc(t.status || 'queued')}</span></div>`).join('') : '<div class="agent-role">No active specialist tasks</div>';
+        const comms = view.agent_communications || [];
+        document.getElementById('agent-comms').innerHTML = comms.length ? comms.slice(0,20).map(e => `<div class="comm-row"><strong>${esc(e.source || 'agent')}</strong> ${esc(e.message || '')}<time>${esc((e.timestamp || '').replace('T',' ').slice(0,19))}</time></div>`).join('') : '<div class="agent-role">Waiting for agent events…</div>';
+      };
+      if (input) apply(input);
+      else _authFetch('/api/dashboard/state?limit=50').then(r => r.ok ? r.json() : null).then(x => apply(x && x.state)).catch(() => {});
+    }
+    refreshAgentCenter(null);
+    setInterval(() => refreshAgentCenter(null), 4000);
 
     function setStatus(s) {
       if (s === 'active') {

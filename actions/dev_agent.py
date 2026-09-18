@@ -18,6 +18,7 @@ PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
 # Model choice, timeout and fallback ladder all live in core/gemini.py.
 from core import gemini
+from core import context_manager, model_router
 
 MODEL_PLANNER    = gemini.SMART
 MODEL_WRITER     = gemini.SMART
@@ -27,15 +28,41 @@ def _get_api_key() -> str:
         return json.load(f)["gemini_api_key"]
 
 
-def _get_model(model_name: str = gemini.SMART):
+class _RoutedResponse:
+    def __init__(self, text: str):
+        self.text = text
+
+
+def _get_model(model_name: str = gemini.SMART, project_id: str = "", phase: str = "reasoning"):
     """Planning and writing whole files — the reasoning tier, and a long
     deadline because the answer is a source file rather than a sentence."""
     class _W:
         def generate_content(self, contents):
-            resp = gemini.call(contents, tier=model_name, timeout_ms=60000)
-            if resp is None:
-                raise RuntimeError("every Gemini model on the ladder failed")
-            return resp
+            prompt = str(contents)
+            handoff = context_manager.context_package(project_id, request=prompt)
+            routed_prompt = (
+                "JARVIS is continuing an existing task. Treat the following as authoritative "
+                "project state. Continue the exact project; do not start a different project "
+                "or discard completed work.\n\n"
+                f"JARVIS PROJECT STATE:\n{handoff}\n\nTASK:\n{prompt}"
+            )
+            try:
+                text, provider = model_router.generate(
+                    routed_prompt,
+                    system="You are a reasoning engine inside JARVIS. JARVIS owns memory, project state, and continuity.",
+                    tier=model_name,
+                    timeout=120,
+                )
+                context_manager.record_event(
+                    project_id, "model_result", f"{phase} completed via {provider}",
+                    provider=provider, task=phase,
+                )
+                return _RoutedResponse(text)
+            except Exception as exc:
+                context_manager.record_event(
+                    project_id, "provider_failure", str(exc), task=phase,
+                )
+                raise
 
     return _W()
 
@@ -106,8 +133,8 @@ class RateLimitError(Exception):
     pass
 
 
-def _plan_project(description: str, language: str) -> dict:
-    model = _get_model(MODEL_PLANNER)
+def _plan_project(description: str, language: str, project_id: str) -> dict:
+    model = _get_model(MODEL_PLANNER, project_id, "planning")
 
     prompt = f"""You are a senior software architect. Create a minimal, complete file plan for this project.
 
@@ -162,8 +189,9 @@ def _write_file(
     language: str,
     project_dir: Path,
     already_written: dict[str, str],
+    project_id: str,
 ) -> str:
-    model = _get_model(MODEL_WRITER)
+    model = _get_model(MODEL_WRITER, project_id, "writing")
 
     file_path = file_info["path"]
     file_desc = file_info.get("description", "")
@@ -358,9 +386,10 @@ def _fix_files(
     language: str,
     project_dir: Path,
     entry_point: str,
+    project_id: str,
 ) -> dict[str, str]:
 
-    model = _get_model(MODEL_PLANNER)
+    model = _get_model(MODEL_PLANNER, project_id, "fixing")
 
     error_file, error_line = _parse_traceback(error_output, list(file_codes.keys()))
     error_type = _classify_error(error_output)
@@ -453,9 +482,15 @@ def _build_project(
         if player:
             player.write_log(f"[DevAgent] {msg}")
 
+    project_id = re.sub(r"[^\w\-]", "_", project_name or description[:48].lower()) or "jarvis_project"
+    context_manager.start_project(project_id, description)
+    context_manager.start_task(
+        f"build-{project_id}", description, project_id=project_id,
+    )
+    context_manager.update_project(project_id, current_task="planning", requirements=[description])
     log("Planning project structure...")
     try:
-        plan = _plan_project(description, language)
+        plan = _plan_project(description, language, project_id)
     except RateLimitError:
         msg = "Rate limit reached, sir. Please try again in a moment."
         if speak: speak(msg)
@@ -467,6 +502,22 @@ def _build_project(
 
     proj_name    = project_name or plan.get("project_name", "jarvis_project")
     proj_name    = re.sub(r"[^\w\-]", "_", proj_name)
+    if proj_name != project_id:
+        project_id = proj_name
+        context_manager.start_project(project_id, description)
+    context_manager.update_project(
+        project_id,
+        technology_stack=[language] + list(plan.get("dependencies", [])),
+        relevant_files=[f.get("path", "") for f in plan.get("files", [])],
+        current_task="writing project files",
+        design_decisions=[f"Entry point: {plan.get('entry_point', 'main.py')}",
+                          f"Run command: {plan.get('run_command', '')}"],
+    )
+    context_manager.update_task(
+        current_step="writing project files",
+        recent_decisions=[f"Technology stack: {language} and declared dependencies"],
+        unfinished_work=["Write and validate planned project files"],
+    )
     project_dir  = PROJECTS_DIR / proj_name
     project_dir.mkdir(parents=True, exist_ok=True)
 
@@ -499,8 +550,17 @@ def _build_project(
                     language=language,
                     project_dir=project_dir,
                     already_written=file_codes,
+                    project_id=project_id,
                 )
                 file_codes[file_path] = code
+                context_manager.update_project(
+                    project_id, completed_work=[f"Wrote {file_path}"],
+                    current_task=f"writing project files ({file_path})",
+                )
+                context_manager.update_task(
+                    current_step=f"writing project files ({file_path})",
+                    completed_work=[f"Wrote {file_path}"],
+                )
                 time.sleep(0.4)
                 break
             except RateLimitError:
@@ -528,6 +588,7 @@ def _build_project(
     auto_installs = 0  
 
     for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
+        context_manager.update_project(project_id, current_task=f"testing project (attempt {attempt})")
         log(f"Running project (attempt {attempt}/{MAX_FIX_ATTEMPTS})...")
         last_output = _run_project(run_command, project_dir, timeout)
         log(f"Output preview: {last_output[:150]}")
@@ -538,6 +599,15 @@ def _build_project(
                 f"Built in {attempt} attempt{'s' if attempt > 1 else ''}. "
                 f"Saved to: {project_dir}"
             )
+            context_manager.update_project(
+                project_id, completed_work=["Project executed successfully"],
+                unfinished_work=[], current_task="completed",
+            )
+            context_manager.update_task(
+                status="completed", current_step="completed",
+                unfinished_work=[], intermediate_results=[last_output[:1200]],
+            )
+            context_manager.record_event(project_id, "task_completed", msg)
             if speak: speak(msg)
             return f"{msg}\n\nOutput:\n{last_output}"
 
@@ -545,6 +615,15 @@ def _build_project(
             break
 
         error_type = _classify_error(last_output)
+        context_manager.update_project(
+            project_id, errors=[last_output[:1200]],
+            unfinished_work=[f"Resolve {error_type} during test attempt {attempt}"],
+        )
+        context_manager.update_task(
+            current_step=f"fixing {error_type}",
+            errors=[last_output[:1200]],
+            unfinished_work=[f"Resolve {error_type} during test attempt {attempt}"],
+        )
         if error_type == "dependency_error" and auto_installs < 3:
             installed = _try_auto_install(last_output, project_dir)
             if installed:
@@ -563,6 +642,7 @@ def _build_project(
                 language=language,
                 project_dir=project_dir,
                 entry_point=entry_point,
+                project_id=project_id,
             )
             file_codes.update(updated)
             time.sleep(1)
@@ -577,6 +657,11 @@ def _build_project(
         f"I couldn't fully fix '{proj_name}' after {MAX_FIX_ATTEMPTS} attempts, sir. "
         f"Project is saved at {project_dir} — open it in VSCode and check manually."
     )
+    context_manager.update_project(project_id, current_task="blocked", errors=[last_output[:1200]])
+    context_manager.update_task(
+        status="blocked", current_step="blocked", errors=[last_output[:1200]],
+    )
+    context_manager.record_event(project_id, "task_failed", msg)
     if speak: speak(msg)
     return f"{msg}\n\nLast error:\n{last_output[:600]}"
 

@@ -7,6 +7,9 @@ No other file needs to change — JARVIS discovers this automatically at startup
 
 PLUGIN = {
     "name": "my_plugin",                     # snake_case, unique, ^[a-zA-Z_][a-zA-Z0-9_]{0,63}$
+    "provider": "example",
+    "version": "1.0.0",
+    "permissions": [],                         # granted separately by the user
     "description": (
         "One or two sentences Gemini uses to decide when to call this tool. "
         "Be explicit about trigger phrases and, if it could be confused with "
@@ -21,6 +24,35 @@ PLUGIN = {
         "required": [],   # omit or leave empty for a zero-argument tool
     },
 }
+
+# Optional multi-tool contract. Existing one-tool plugins need not define this.
+# Each handler receives the normal parameters dict and may declare player and
+# session_memory as optional keyword arguments.
+PLUGIN_VERSION = "1.0.0"
+PLUGIN_TOOLS = [
+    # {
+    #     "name": "search",
+    #     "description": "Search the provider",
+    #     "parameters": {"type": "OBJECT", "properties": {}},
+    #     "permissions": ["READ"],
+    #     "destructive": False,
+    #     "handler": search,
+    # },
+]
+
+
+def status() -> dict:
+    """Return connection state without exposing credentials."""
+    return {"connected": False, "error": "Not configured"}
+
+
+def connect() -> bool:
+    """Authenticate using credentials retrieved by the plugin itself."""
+    return False
+
+
+def disconnect() -> None:
+    return None
 
 def run(parameters: dict, player=None, session_memory=None) -> str:
     """

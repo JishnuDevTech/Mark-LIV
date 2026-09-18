@@ -1813,8 +1813,11 @@ class PluginManagerOverlay(QWidget):
 
     _OW = 420
 
-    def __init__(self, plugins: list[dict], parent=None):
+    def __init__(self, plugins: list[dict], lifecycle=None,
+                 open_settings=None, parent=None):
         super().__init__(parent)
+        self._lifecycle = lifecycle
+        self._open_settings = open_settings
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             PluginManagerOverlay {{
@@ -1869,7 +1872,16 @@ class PluginManagerOverlay(QWidget):
         lbl = QLabel(label_text)
         lbl.setFont(QFont("Courier New", 8))
         lbl.setStyleSheet(f"color: {C.TEXT if p['valid'] else C.TEXT_DIM}; background: transparent;")
-        lbl.setToolTip(p["description"] if p["valid"] else p["error"])
+        if p["valid"]:
+            metadata = []
+            if p.get("provider"):
+                metadata.append(f"Provider: {p['provider']}")
+            metadata.append(f"Connection: {p.get('connection', 'unknown')}")
+            if p.get("permissions"):
+                metadata.append("Permissions: " + ", ".join(p["permissions"]))
+            lbl.setToolTip(p["description"] + "\n" + "\n".join(metadata))
+        else:
+            lbl.setToolTip(p["error"])
         lbl.setWordWrap(False)
         row.addWidget(lbl, stretch=1)
 
@@ -1890,7 +1902,48 @@ class PluginManagerOverlay(QWidget):
             self._style_toggle(btn, p["enabled"])
             btn.clicked.connect(lambda _, name=p["name"], b=btn: self._toggle(name, b))
         row.addWidget(btn)
+        if p.get("valid") and self._lifecycle:
+            connect = QPushButton("CONNECTED" if p.get("connected") else "CONNECT")
+            connect.setFixedSize(92, 24)
+            connect.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            connect.setCursor(Qt.CursorShape.PointingHandCursor)
+            connect.setStyleSheet(f"""
+                QPushButton {{ background: transparent; color: {C.PRI};
+                    border: 1px solid {C.BORDER}; border-radius: 3px; }}
+                QPushButton:hover {{ border-color: {C.PRI}; }}
+            """)
+            connect.clicked.connect(
+                lambda _, name=p["name"], b=connect:
+                    self._connect(name, b, p.get("connected", False))
+            )
+            row.addWidget(connect)
         return row
+
+    def _connect(self, name: str, button: QPushButton, connected: bool):
+        if button.text() == "CONFIGURE":
+            if self._open_settings:
+                self._open_settings()
+            else:
+                button.setToolTip(
+                    "Open Controls → Plugin Settings to enter the credential."
+                )
+            return
+        try:
+            result = self._lifecycle(name, "disconnect" if connected else "connect")
+            ok = bool(result.get("ok")) if isinstance(result, dict) else bool(result)
+            if ok:
+                button.setText("CONNECT" if connected else "CONNECTED")
+            else:
+                button.setText("CONFIGURE")
+                message = str(result.get("error", "Connection failed")) if isinstance(result, dict) else str(result)
+                button.setToolTip(
+                    message
+                    + " Open Controls → Plugin Settings, enter the credential, "
+                      "click SAVE, then use CONNECT / TEST."
+                )
+        except Exception as exc:
+            button.setText("ERROR")
+            button.setToolTip(str(exc))
 
     def _style_toggle(self, btn: QPushButton, enabled: bool):
         if enabled:
@@ -2082,7 +2135,7 @@ class AudioDeviceOverlay(_HudOverlay):
             # startup, so opening this panel never blocks the Qt thread on the
             # host audio API.
             box.addItem(DEFAULT_LABEL, "")
-            for name in list_devices(kind):
+            for name in list_devices(kind, refresh=(kind == "input")):
                 box.addItem(name, name)
             idx = box.findData(current) if current else 0
             box.setCurrentIndex(idx if idx >= 0 else 0)
@@ -2964,6 +3017,7 @@ class MainWindow(QMainWindow):
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by JarvisLive
+        self._lifecycle        = None   # callable: (plugin, operation) -> status dict
         self.on_wake_toggle    = None   # callable: (enable: bool) -> str, set by JarvisLive
         self.on_wake_manual    = None   # callable: () -> None — manual sleep/wake
         self.on_push_to_talk   = None   # callable: (enable: bool) -> str scope
@@ -3782,6 +3836,33 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
             return l
 
+        lay.addWidget(_sec("AGENT HIERARCHY"))
+        agent_grid = QVBoxLayout()
+        agent_grid.setSpacing(3)
+        root = QLabel("◉ JARVIS  /  ORCHESTRATOR")
+        root.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        root.setStyleSheet(f"color: {C.GREEN}; background: {C.PRI_GHO}; border: 1px solid {C.GREEN_D}; padding: 5px;")
+        agent_grid.addWidget(root)
+        self._agent_cards = {}
+        for name, role, voice in (
+            ("FRIDAY", "PRODUCTIVITY", "ARIA"),
+            ("ULTRON", "ENGINEERING", "GUY"),
+            ("MESSENGER", "COMMUNICATION", "RYAN"),
+        ):
+            card = QLabel(f"  └─ {name}   {role}   [{voice}]")
+            card.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            card.setStyleSheet(f"color: {C.TEXT_MED}; background: {C.PANEL2}; border: 1px solid {C.BORDER}; padding: 4px;")
+            agent_grid.addWidget(card)
+            self._agent_cards[name] = card
+        self._agent_task_status = QLabel("TASK MONITOR  •  idle")
+        self._agent_task_status.setFont(QFont("Courier New", 7))
+        self._agent_task_status.setStyleSheet(f"color: {C.ACC2}; background: transparent;")
+        agent_grid.addWidget(self._agent_task_status)
+        lay.addLayout(agent_grid)
+
+        sep_agents = QFrame(); sep_agents.setFrameShape(QFrame.Shape.HLine)
+        sep_agents.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
+        lay.addWidget(sep_agents)
         lay.addWidget(_sec("ACTIVITY LOG"))
         self._log = LogWidget()
         lay.addWidget(self._log, stretch=1)
@@ -5067,7 +5148,12 @@ class MainWindow(QMainWindow):
     def _open_plugin_manager(self):
         plugins = self.get_plugins() if self.get_plugins else []
         cw = self.centralWidget()
-        ov = PluginManagerOverlay(plugins, parent=cw)
+        ov = PluginManagerOverlay(
+            plugins,
+            lifecycle=self._lifecycle,
+            open_settings=self._open_plugin_settings,
+            parent=cw,
+        )
         ov.adjustSize()
         ov.setGeometry(
             (cw.width()  - ov.width())  // 2,
@@ -5298,6 +5384,14 @@ class JarvisUI:
     @get_plugin_settings.setter
     def get_plugin_settings(self, cb):
         self._win.get_plugin_settings = cb
+
+    @property
+    def plugin_lifecycle(self):
+        return self._win._lifecycle
+
+    @plugin_lifecycle.setter
+    def plugin_lifecycle(self, cb):
+        self._win._lifecycle = cb
 
     @property
     def on_wake_toggle(self):

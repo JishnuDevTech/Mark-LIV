@@ -13,6 +13,7 @@ else:
     _WIN_HIDE: dict = {}
 import time
 import random
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -247,6 +248,54 @@ def _screenshot(save_path: str | None = None) -> str:
     return f"Screenshot saved: {path}"
 
 
+@dataclass(frozen=True)
+class _ScreenObservation:
+    image: object
+    image_size: tuple[int, int]
+    logical_size: tuple[int, int]
+    signature: bytes
+
+
+def _observe_screen() -> _ScreenObservation:
+    """Capture the current screen and retain both pixel and logical dimensions."""
+    _require_pyautogui()
+    image = pyautogui.screenshot()
+    image_size = tuple(image.size)
+    logical_size = tuple(pyautogui.size())
+    thumb = image.copy()
+    thumb.thumbnail((320, 200))
+    return _ScreenObservation(
+        image=image,
+        image_size=image_size,
+        logical_size=logical_size,
+        signature=thumb.tobytes(),
+    )
+
+
+def _screen_signature():
+    """Backward-compatible signature helper used by existing callers."""
+    return _observe_screen().signature
+
+
+def _screen_changed(before: _ScreenObservation, after: _ScreenObservation) -> bool:
+    """Use a normalized pixel comparison so Retina size differences do not matter."""
+    if before.image_size != after.image_size:
+        return True
+    try:
+        a = before.image.resize((160, 100)).convert("RGB")
+        b = after.image.resize((160, 100)).convert("RGB")
+        pixels_a, pixels_b = a.load(), b.load()
+        changed = 0
+        total = 160 * 100
+        for y in range(100):
+            for x in range(160):
+                if max(abs(pixels_a[x, y][i] - pixels_b[x, y][i]) for i in range(3)) > 18:
+                    changed += 1
+        return changed / total >= 0.002
+    except Exception:
+        return before.signature != after.signature
+
+
 def _clear_field() -> str:
     _require_pyautogui()
     select_key = "command" if _get_os() == "mac" else "ctrl"
@@ -310,7 +359,7 @@ def _focus_window(title: str) -> str:
 
     return f"focus_window: unknown OS '{os_name}'"
 
-def _screen_find(description: str) -> tuple[int, int] | None:
+def _screen_locate(description: str) -> dict | None:
     api_key = _get_api_key()
     if not api_key:
         print("[ComputerControl] ⚠️ No API key for screen_find")
@@ -320,18 +369,21 @@ def _screen_find(description: str) -> tuple[int, int] | None:
         from google import genai
         from google.genai import types as gtypes
 
-        _require_pyautogui()
-        w, h  = pyautogui.size()
-        img   = pyautogui.screenshot()
+        observation = _observe_screen()
+        img = observation.image
+        image_w, image_h = observation.image_size
+        logical_w, logical_h = observation.logical_size
         buf   = io.BytesIO()
         img.save(buf, format="PNG")
         image_bytes = buf.getvalue()
 
         prompt = (
-            f"This is a screenshot of a {w}×{h} pixel screen. "
+            f"This screenshot is {image_w}×{image_h} image pixels. "
             f"Locate the UI element described as: '{description}'. "
-            f"Reply with ONLY the center coordinates as: x,y "
-            f"If the element is not visible, reply: NOT_FOUND"
+            "Return ONLY JSON in the screenshot pixel coordinate space: "
+            '{"found":true,"x":123,"y":456,"confidence":0.0,"box":[left,top,right,bottom]}. '
+            'Use the center point. Set found=false when it is not visible. '
+            "Do not guess an element that is not visible."
         )
 
         from core import gemini
@@ -343,17 +395,88 @@ def _screen_find(description: str) -> tuple[int, int] | None:
             return None
 
         text = (response.text or "").strip()
+        match_json = re.search(r"\{.*\}", text, re.DOTALL)
+        if match_json:
+            try:
+                parsed = json.loads(match_json.group(0))
+                if not parsed.get("found", False):
+                    return None
+                confidence = float(parsed.get("confidence", 0))
+                x, y = float(parsed["x"]), float(parsed["y"])
+                if confidence < 0.65:
+                    print(f"[ComputerControl] ⚠️ Low-confidence target ({confidence:.2f})")
+                    return None
+                if not (0 <= x <= image_w and 0 <= y <= image_h):
+                    return None
+                return {
+                    "pixel": (x, y),
+                    "confidence": confidence,
+                    "logical": (
+                        round(x * logical_w / image_w),
+                        round(y * logical_h / image_h),
+                    ),
+                }
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                pass
         if "NOT_FOUND" in text.upper():
             return None
 
         match = re.search(r"(\d+)\s*,\s*(\d+)", text)
         if match:
-            return int(match.group(1)), int(match.group(2))
+            x, y = int(match.group(1)), int(match.group(2))
+            if 0 <= x <= image_w and 0 <= y <= image_h:
+                return {
+                    "pixel": (x, y),
+                    "confidence": 0.65,
+                    "logical": (
+                        round(x * logical_w / image_w),
+                        round(y * logical_h / image_h),
+                    ),
+                }
 
     except Exception as e:
         print(f"[ComputerControl] ⚠️ screen_find failed: {e}")
 
     return None
+
+
+def _screen_find(description: str) -> tuple[int, int] | None:
+    """Locate a target and return PyAutoGUI logical coordinates."""
+    located = _screen_locate(description)
+    return tuple(located["logical"]) if located else None
+
+
+def _verified_screen_click(description: str, button: str = "left",
+                           clicks: int = 1, retries: int = 2,
+                           expected: str = "") -> str:
+    """LOOK → LOCATE → ACT → VERIFY, re-locating after every failed attempt."""
+    if not description.strip():
+        return "Cannot click an unnamed screen target."
+    last_reason = "target not found"
+    for attempt in range(1, retries + 2):
+        before = _observe_screen()
+        located = _screen_locate(description)
+        if not located:
+            last_reason = "target was not visible with sufficient confidence"
+            continue
+        x, y = located["logical"]
+        _move(x, y, duration=0.15)
+        _click(x=x, y=y, button=button, clicks=clicks)
+        time.sleep(0.45)
+        after = _observe_screen()
+        changed = _screen_changed(before, after)
+        expected_visible = bool(expected and _screen_locate(expected))
+        if changed or expected_visible:
+            return (
+                f"Verified click on '{description}' at ({x}, {y}) "
+                f"(confidence {located['confidence']:.2f}, attempt {attempt})."
+            )
+        last_reason = "post-click screen did not show an observable state change"
+        time.sleep(0.25)
+    return (
+        f"Click not verified for '{description}' after {retries + 1} attempts: "
+        f"{last_reason}. No success is claimed."
+    )
 
 def computer_control(
     parameters: dict,
@@ -398,8 +521,9 @@ def computer_control(
       wait          — sleep N seconds
       clear_field   — select-all + delete
       focus_window  — bring window to foreground
-      screen_find   — AI element finder (returns x,y)
-      screen_click  — AI element finder + click
+        screen_find   — AI element finder with confidence and Retina-aware coordinates
+        screen_click  — grounded click with post-action verification and re-localization
+        observe_act_verify — closed-loop action wrapper; use for important actions
       random_data   — generate fake form data
       user_data     — pull real data from memory
     """
@@ -415,6 +539,38 @@ def computer_control(
     print(f"[ComputerControl] ▶ {action}  {params}")
 
     try:
+
+        if action == "observe_act_verify":
+            nested = dict(params.get("action_params") or {})
+            nested_action = str(params.get("target_action", "")).strip().lower()
+            if not nested_action or nested_action == "observe_act_verify":
+                return "A target_action is required for observe_act_verify."
+            before = _observe_screen()
+            target = str(params.get("description", nested.get("description", ""))).strip()
+            expected = str(params.get("expected", "")).strip()
+            if nested_action in {"screen_click", "click_target"}:
+                return _verified_screen_click(
+                    target,
+                    button=str(nested.get("button", "left")),
+                    clicks=int(nested.get("clicks", 1)),
+                    retries=int(params.get("retries", 2)),
+                    expected=expected,
+                )
+            nested["action"] = nested_action
+            action_result = computer_control(nested, player=player)
+            time.sleep(min(max(float(params.get("settle_seconds", 0.5)), 0.1), 3.0))
+            after = _observe_screen()
+            changed = _screen_changed(before, after)
+            verified = changed
+            verification = "screen changed"
+            if expected:
+                coords = _screen_find(expected)
+                verified = coords is not None
+                verification = f"'{expected}' visible at {coords}" if coords else f"'{expected}' not found"
+            return (
+                f"Action result: {action_result}\n"
+                f"Verification: {'passed' if verified else 'failed'} ({verification})."
+            )
 
         if action == "type":
             return _type(params.get("text", ""))
@@ -467,17 +623,21 @@ def computer_control(
             return _screenshot(params.get("path"))
 
         if action == "screen_find":
-            coords = _screen_find(params.get("description", ""))
-            return f"{coords[0]},{coords[1]}" if coords else "NOT_FOUND"
+            description = str(params.get("description", "")).strip()
+            located = _screen_locate(description) if description else None
+            if not located:
+                return f"NOT_FOUND: Could not confidently locate '{description}'."
+            x, y = located["logical"]
+            return f"{x},{y} (confidence {located['confidence']:.2f})"
 
         if action == "screen_click":
-            desc   = params.get("description", "")
-            coords = _screen_find(desc)
-            if coords:
-                time.sleep(0.2)
-                _click(x=coords[0], y=coords[1])
-                return f"Clicked '{desc}' at {coords}"
-            return f"Element not found on screen: '{desc}'"
+            return _verified_screen_click(
+                str(params.get("description", "")),
+                button=str(params.get("button", "left")),
+                clicks=int(params.get("clicks", 1)),
+                retries=int(params.get("retries", 2)),
+                expected=str(params.get("expected", "")),
+            )
 
         if action == "wait":
             secs = float(params.get("seconds", 1.0))
@@ -516,13 +676,18 @@ def computer_control(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "computer_control",
-    "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen.",
+    "description": (
+        "Closed-loop computer control. For visible UI targets use screen_click "
+        "(LOOK, LOCATE, ACT, VERIFY) or observe_act_verify; it captures a current "
+        "screen, grounds the target, handles Retina scaling, verifies the result, "
+        "and re-localizes before retrying. Do not guess coordinates."
+    ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | random_data | user_data"
+                "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | observe_act_verify | random_data | user_data"
             },
             "text": {
                 "type": "STRING",
@@ -562,7 +727,7 @@ TOOL = {
             },
             "description": {
                 "type": "STRING",
-                "description": "Element description for screen_find/screen_click"
+                "description": "Visible UI target description for screen_find/screen_click"
             },
             "type": {
                 "type": "STRING",
@@ -579,6 +744,34 @@ TOOL = {
             "path": {
                 "type": "STRING",
                 "description": "Save path for screenshot"
+            },
+            "target_action": {
+                "type": "STRING",
+                "description": "Single existing action to perform inside observe_act_verify"
+            },
+            "action_params": {
+                "type": "OBJECT",
+                "description": "Parameters for target_action"
+            },
+            "expected": {
+                "type": "STRING",
+                "description": "Optional visible element description to verify after the action"
+            },
+            "button": {
+                "type": "STRING",
+                "description": "Mouse button for grounded clicks: left or right"
+            },
+            "clicks": {
+                "type": "INTEGER",
+                "description": "Number of clicks for grounded screen_click"
+            },
+            "retries": {
+                "type": "INTEGER",
+                "description": "Additional locate/act/verify attempts (default: 2)"
+            },
+            "settle_seconds": {
+                "type": "NUMBER",
+                "description": "Seconds to wait before verification"
             }
         },
         "required": [
