@@ -37,7 +37,7 @@ def _save(events: list[dict]) -> None:
 
 def publish(event_type: str, message: str, *, source: str = "jarvis",
             importance: str = "NORMAL", task_id: str = "", project_id: str = "",
-            dedupe_key: str = "") -> dict:
+            dedupe_key: str = "", **fields) -> dict:
     importance = str(importance).upper()
     if importance not in PRIORITIES:
         importance = "NORMAL"
@@ -68,6 +68,9 @@ def publish(event_type: str, message: str, *, source: str = "jarvis",
             "classification": classification,
             "delivery": {"status": "pending", "devices": {}},
         }
+        # Optional routing metadata (for example target_agent) stays in the
+        # canonical event stream without requiring a second communication bus.
+        event.update({str(key): value for key, value in fields.items() if value is not None})
         events.append(event)
         _save(events)
     if _listener:

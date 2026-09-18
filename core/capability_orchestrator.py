@@ -244,6 +244,11 @@ class BossCoordinator:
     def __init__(self, agents, events, runtime=None, logger: Callable[[str], None] = print):
         self.agents = agents
         self.events = events
+        # RuntimeState is the existing task store.  Keep accepting an injected
+        # facade for tests and integrations, but never create a second store.
+        if runtime is None:
+            from core.runtime_state import runtime_state
+            runtime = runtime_state
         self.runtime = runtime
         self.logger = logger
 
@@ -266,7 +271,40 @@ class BossCoordinator:
             "message", "notify", "tell", "send", "communication",
         )):
             routes.append("MESSENGER")
-        return routes or ["ULTRON"]
+        # An ambiguous objective must not silently become a coding task.
+        return routes
+
+    def _select_tool(self, agent_name: str, objective: str,
+                     requested: str = "") -> str:
+        """Choose one registered capability deterministically for a child."""
+        specialist = self.agents.get(agent_name)
+        if specialist is None:
+            return ""
+        available = set(specialist.status().get("available_capabilities", []))
+        if requested:
+            return requested if requested in available else ""
+        if not available:
+            return ""
+        text = objective.lower()
+        # Prefer concrete capabilities whose names occur in the objective, then
+        # use stable role-specific ordering rather than registry iteration order.
+        preferred = {
+            "ULTRON": ("dev_agent", "code_helper", "file_processor", "project_access"),
+            "FRIDAY": ("productivity", "plugins", "reminder", "send_mobile_notification"),
+            "MESSENGER": ("send_mobile_message", "send_mobile_notification",
+                          "event_summary", "get_mobile_status"),
+        }.get(agent_name, ())
+        for capability in preferred:
+            if capability in available and (capability.replace("_", " ") in text
+                                            or capability in text):
+                return capability
+        return next((capability for capability in preferred if capability in available),
+                    sorted(available)[0])
+
+    def _persist(self, objective: str, *, task_id: str, status: str, **fields) -> None:
+        self.runtime.register_background_task(
+            objective, task_id=task_id, status=status, owner="JARVIS", **fields,
+        )
 
     async def delegate(self, objective: str, *, project_id: str = "",
                        user_instructions: str = "", tools: dict[str, str] | None = None,
@@ -279,64 +317,86 @@ class BossCoordinator:
             )
         parent_id = f"boss_{uuid.uuid4().hex[:12]}"
         routes = self._route(objective)
-        if self.runtime:
-            self.runtime.register_background_task(
-                objective, task_id=parent_id, status="running",
-                project_id=project_id, owner="JARVIS", children=routes,
+        if not routes:
+            self._persist(objective, task_id=parent_id, status="failed",
+                          project_id=project_id, children=[])
+            return structured_result(
+                agent="JARVIS", task=objective, status="failed",
+                errors=["No specialist capability matches this objective."],
+                task_id=parent_id, objective=objective, delegated_to=[],
             )
+        child_ids = [f"{parent_id}:{name.lower()}" for name in routes]
+        self._persist(objective, task_id=parent_id, status="planned",
+                      project_id=project_id, children=child_ids)
         context_manager.start_task(parent_id, objective, project_id)
         self.events.publish(
             "jarvis_delegation_started", f"JARVIS delegated: {objective}",
             source="JARVIS", task_id=parent_id, project_id=project_id,
         )
         results = []
-        for agent_name in routes:
+        for agent_name, child_id in zip(routes, child_ids):
+            self._persist(objective, task_id=child_id, status="planned",
+                          project_id=project_id, parent_task_id=parent_id,
+                          agent=agent_name)
             specialist = self.agents.get(agent_name)
             if specialist is None:
                 results.append(structured_result(
                     agent=agent_name, task=objective, status="failed",
-                    errors=["Specialist is not registered."],
+                    errors=["Specialist is not registered."], task_id=child_id,
                 ))
                 continue
+            tool_name = self._select_tool(
+                agent_name, objective, (tools or {}).get(agent_name, ""),
+            )
             handoff = build_handoff(
-                agent_id=agent_name, task_id=parent_id, project_id=project_id,
-                task={"objective": objective},
+                agent_id=agent_name, task_id=child_id, project_id=project_id,
+                task={"objective": objective, "parent_task_id": parent_id,
+                      "tool": tool_name},
                 relevant_memory=specialist.memory.retrieve(project_id=project_id),
                 constraints=["JARVIS remains the owner of final decisions."],
                 user_instructions=user_instructions,
             )
-            tool_name = (tools or {}).get(agent_name, "")
             if not tool_name:
                 result = structured_result(
                     agent=agent_name, task=objective, status="failed",
-                    errors=[f"No executable capability was selected for {agent_name}."],
-                    recommendations=["Provide a concrete tool or let the model select one."],
+                    errors=[f"No available capability exists for {agent_name}."],
+                    task_id=child_id,
                 )
             else:
                 result = await self.agents.assign(
                     agent_name,
                     {"tool": tool_name, "parameters": {"shared_context": handoff},
                      "objective": objective},
-                    project_id=project_id, task_id=f"{parent_id}:{agent_name.lower()}",
+                    project_id=project_id, task_id=child_id,
                     player=player, session_memory=session_memory,
                 )
             results.append(result)
             self.events.publish(
-                "agent_message", f"JARVIS → {agent_name}: delegation result received",
+                "agent_message",
+                f"JARVIS → {agent_name}: delegation result received",
                 source="JARVIS", task_id=parent_id, project_id=project_id,
-                importance="NORMAL",
+                importance="NORMAL", target_agent=agent_name,
+                communication_type="agent_to_agent",
             )
         failed = [item for item in results if item.get("status") == "failed" or item.get("ok") is False]
         status = "failed" if failed else "completed"
-        if self.runtime:
-            self.runtime.update_background_task(parent_id, status, results=results)
+        for result, child_id in zip(results, child_ids):
+            self.runtime.update_background_task(child_id, result.get("status", "failed"),
+                                                result=result)
+        self.runtime.update_background_task(parent_id, status, results=results)
         self.events.publish(
             "jarvis_delegation_completed", f"JARVIS delegation {status}: {objective}",
             source="JARVIS", task_id=parent_id, project_id=project_id,
             importance="IMPORTANT" if failed else "NORMAL",
         )
-        return {
-            "ok": not failed, "agent": "JARVIS", "task_id": parent_id,
-            "status": status, "objective": objective, "delegated_to": routes,
-            "results": results,
-        }
+        return structured_result(
+            agent="JARVIS", task=objective, status=status,
+            summary=f"{len(results) - len(failed)}/{len(results)} specialist tasks completed.",
+            task_id=parent_id, parent_task_id=parent_id, objective=objective,
+            delegated_to=routes, child_task_ids=child_ids, results=results,
+        )
+
+    # Public names used by Core callers; delegate remains the backwards-
+    # compatible entry point used by the existing delegate_objective tool.
+    coordinate = delegate
+    orchestrate = delegate
