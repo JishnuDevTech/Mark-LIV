@@ -1593,8 +1593,15 @@ class JarvisLive:
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
+        _reported_status = False
 
         def callback(indata, frames, time_info, status):
+            nonlocal _reported_status
+            if status and not _reported_status:
+                _reported_status = True
+                message = f"SYS: Microphone stream warning: {status}"
+                print(f"[JARVIS] ⚠️ {message}")
+                self.ui.write_log(message)
             # ── Wake-word gate ───────────────────────────────────────────────
             # While asleep, the mic audio NEVER goes to Gemini (nothing is
             # streamed, so JARVIS can't respond to speech not addressed to it and
@@ -1704,10 +1711,15 @@ class JarvisLive:
 
             with _mic_stream:
                 print("[JARVIS] 🎤 Mic stream open")
+                self.ui.write_log(
+                    "SYS: Microphone is listening. Speak normally; "
+                    "your input is streamed only while JARVIS is awake."
+                )
                 while True:
                     await asyncio.sleep(0.1)
         except Exception as e:
             print(f"[JARVIS] ❌ Mic: {e}")
+            self.ui.write_log(f"ERR: Microphone unavailable — {e}")
             raise
 
     async def _flush_pending_vision(self) -> bool:
@@ -2534,10 +2546,25 @@ class JarvisLive:
                     # Wake word: if enabled, come up ASLEEP (mic gated, silent)
                     # until the user says "Hey Jarvis" or taps wake in the UI.
                     if self._wake_enabled:
-                        self._ensure_wake_detector()
-                        self._awake = False
-                        self.ui.set_state("SLEEPING")
-                        self.ui.write_log("SYS: JARVIS online — sleeping. Say 'Hey Jarvis' to wake me.")
+                        if self._ensure_wake_detector():
+                            self._awake = False
+                            self.ui.set_state("SLEEPING")
+                            self.ui.write_log(
+                                "SYS: JARVIS online — sleeping. Say 'Hey Jarvis' "
+                                "to wake me, or tap WAKE NOW. 'Wake up' needs a "
+                                "separately trained local wake model."
+                            )
+                        else:
+                            # Never leave a failed wake model blocking the main
+                            # voice input path. The user can still speak and can
+                            # retry installation from the settings drawer.
+                            self._wake_enabled = False
+                            self._awake = True
+                            self.ui.set_state("LISTENING")
+                            self.ui.write_log(
+                                "ERR: Wake-word model unavailable; wake gating "
+                                "disabled so microphone input remains available."
+                            )
                     else:
                         self._awake = True
                         self.ui.set_state("LISTENING")

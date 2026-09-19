@@ -1,5 +1,5 @@
 """
-Local wake-word detection for JARVIS ("Hey Jarvis").
+Local wake-word detection for JARVIS.
 
 Design goals:
   • ZERO cost when the feature is off — openwakeword is imported ONLY inside
@@ -24,8 +24,12 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-# Pretrained openwakeword model that listens for "Hey Jarvis".
+import numpy as np
+
+# openWakeWord currently ships this pretrained model. It cannot detect an
+# arbitrary phrase such as "wake up" without a separately trained model.
 WAKE_MODEL = "hey_jarvis"
+WAKE_PHRASE = "Hey Jarvis"
 # Score in [0,1]; above this counts as a detection. Tunable per environment.
 DEFAULT_THRESHOLD = 0.5
 # Mic frames arrive at 16 kHz int16; this is just the detector's input rate.
@@ -124,6 +128,7 @@ class WakeWordDetector:
         # `notify` is the activity log and gets only what the user must act on.
         self._notify    = notify or (lambda _msg: None)
         self._queue: queue.Queue = queue.Queue(maxsize=50)
+        self._pending = None
         self._thread: threading.Thread | None = None
         self._running = False
         self._model = None
@@ -146,7 +151,10 @@ class WakeWordDetector:
         self._ready = True
         self._thread = threading.Thread(target=self._loop, daemon=True, name="WakeWordThread")
         self._thread.start()
-        self._logger("Wake word: listening for 'Hey Jarvis'.")
+        self._logger(
+            f"Wake word: listening for '{WAKE_PHRASE}'. "
+            "The installed pretrained model does not support custom phrases."
+        )
         return True
 
     def stop(self) -> None:
@@ -169,9 +177,19 @@ class WakeWordDetector:
         if not self._running:
             return
         try:
-            # frame_int16 is a numpy int16 array (possibly 2-D mono) — flatten to 1-D
-            data = frame_int16[:, 0].copy() if getattr(frame_int16, "ndim", 1) > 1 else frame_int16.copy()
-            self._queue.put_nowait(data)
+            # openWakeWord is trained around 80 ms (1280 samples) windows.
+            # sounddevice delivers 1024-sample callbacks here, so combine
+            # callbacks before inference instead of feeding undersized windows.
+            data = frame_int16[:, 0] if getattr(frame_int16, "ndim", 1) > 1 else frame_int16
+            data = np.asarray(data, dtype=np.int16)
+            pending = data if self._pending is None else np.concatenate((self._pending, data))
+            window = 1280
+            count = len(pending) // window
+            if count:
+                for offset in range(count):
+                    self._queue.put_nowait(pending[offset * window:(offset + 1) * window].copy())
+                pending = pending[count * window:]
+            self._pending = pending.copy()
         except queue.Full:
             pass
         except Exception:
